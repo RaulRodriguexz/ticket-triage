@@ -22,7 +22,7 @@ def _resultado(chamado, categoria=None, prioridade=None, latencia=1000, custo=0.
         id=chamado.id,
         categoria=categoria or g.categoria,
         prioridade=prioridade or g.prioridade,
-        resumo="r", resposta_sugerida="r", justificativa="r",
+        resumo="r", resposta_sugerida="r", justificativa="r", confianca="alta",
         meta=Meta(modelo="m", latencia_ms=latencia, tokens_entrada=1, tokens_saida=1, custo_usd=custo),
     )
 
@@ -151,3 +151,76 @@ def test_estabilidade():
     variada[1] = _resultado(chamados[1], prioridade="media")
     assert estabilidade([base, base, base]) == 13
     assert estabilidade([base, variada, base]) == 12
+
+
+def _relatorio(custo, acertos=10, critico=False, taxa=None, total=10):
+    chamados = _lote(total)
+    resultados = _corretos(chamados, custo=custo)
+    for i in range(1, 1 + total - acertos):
+        resultados[i] = _resultado(chamados[i], prioridade="media", custo=custo)
+    if critico:
+        resultados[0] = _resultado(chamados[0], prioridade="baixa", custo=custo)
+    rel = avaliar(chamados, resultados, "m")
+    return rel.model_copy(update={"taxa_escalonamento": taxa})
+
+
+def _comparar(roteador, sonnet=None, haiku=None):
+    from triagem.avaliacao import comparar
+
+    return comparar({"roteador": roteador, "sonnet": sonnet or _relatorio(0.010),
+                     "haiku": haiku or _relatorio(0.003)}).comparacao
+
+
+def test_comparacao_aprovada_com_economia_e_acerto():
+    bloco = _comparar(_relatorio(0.006, taxa=0.3))  # 40% mais barato, mesmo acerto
+    assert bloco.economia_pct == 40.0
+    assert {n: m.status for n, m in bloco.metas.items()} == {
+        "metas_individuais": "ok", "acerto_conjunto": "ok", "criticos_subestimados": "ok",
+        "economia_vs_sonnet": "ok", "acerto_vs_sonnet": "ok",
+    }
+    assert bloco.aprovado
+
+
+def test_economia_abaixo_de_40_reprova():
+    bloco = _comparar(_relatorio(0.0079))  # 21% de economia
+    assert bloco.metas["economia_vs_sonnet"].status == "falhou"
+    assert not bloco.aprovado
+
+
+def test_acerto_abaixo_do_sonnet_reprova_mesmo_barato():
+    bloco = _comparar(_relatorio(0.004, acertos=8), sonnet=_relatorio(0.010, acertos=9))
+    assert bloco.metas["acerto_conjunto"].status == "ok"      # 80% ainda atinge a meta absoluta
+    assert bloco.metas["acerto_vs_sonnet"].status == "falhou"
+    assert not bloco.aprovado
+
+
+def test_critico_subestimado_no_roteador_reprova():
+    bloco = _comparar(_relatorio(0.004, critico=True))
+    assert bloco.metas["criticos_subestimados"].status == "falhou"
+    assert not bloco.aprovado
+
+
+def test_escalonamento_maximo_para_meta():
+    from triagem.avaliacao import escalonamento_maximo
+
+    # Haiku custa 30% do Sonnet: 0,3 + t <= 0,6  →  t <= 30%.
+    assert escalonamento_maximo(0.003, 0.010) == pytest.approx(0.3)
+    assert escalonamento_maximo(0.007, 0.010) == 0.0   # nem sem escalar daria 40%
+    assert escalonamento_maximo(None, 0.010) is None
+    assert _comparar(_relatorio(0.006, taxa=0.5)).escalonamento_maximo_para_meta == pytest.approx(0.3)
+
+
+def test_gasto_de_triagem_com_erro_entra_no_custo():
+    from triagem.modelos import Meta as MetaModelo
+
+    chamados = _lote(10)
+    resultados = _corretos(chamados, custo=0.005)
+    gasto = MetaModelo(modelo="m", latencia_ms=1, tokens_entrada=1, tokens_saida=1, custo_usd=0.004)
+    resultados[1] = ErroTriagem(id="S-01", erro=DetalheErro(tipo="validacao", mensagem="x"), gasto=gasto)
+    sem_usage = gasto.model_copy(update={"custo_usd": None, "custos_desconhecidos": 1})
+    resultados[2] = ErroTriagem(id="S-02", erro=DetalheErro(tipo="timeout", mensagem="x"), gasto=sem_usage)
+
+    rel = avaliar(chamados, resultados, "m")
+    assert rel.custo_total_usd == pytest.approx(8 * 0.005 + 0.004)
+    assert rel.custos_desconhecidos == 1
+    assert rel.metas["custo_medio_usd"].status == "nao_medida"

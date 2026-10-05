@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 evals_old/
 build/
+data/
+.vercel/

@@ -4,10 +4,11 @@ Superfície estável: os nomes em `__all__`. O resto é interno e pode mudar.
 """
 
 from .erros import ErroConfiguracao, ErroEntrada, FalhaTriagem
-from .modelos import Categoria, Chamado, Meta, Prioridade, ResultadoTriagem, Triagem
+from .modelos import Categoria, Chamado, Confianca, Meta, Prioridade, ResultadoTriagem, Triagem
+from .roteador import RegraRoteamento
 from .servico import Triador, triar
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "triar",
@@ -20,6 +21,8 @@ __all__ = [
     "Meta",
     "Categoria",
     "Prioridade",
+    "Confianca",
+    "RegraRoteamento",
     "Chamado",
     "__version__",
 ]

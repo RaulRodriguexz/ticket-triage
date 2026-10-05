@@ -9,14 +9,18 @@ from pathlib import Path
 from typing import Any
 
 from . import entrada
-from .avaliacao import avaliar, estabilidade
-from .config import MODELO_PADRAO
+from .avaliacao import avaliar, comparar, estabilidade
+from .config import MODELO_HAIKU, MODELO_PADRAO, MODELO_SONNET, MODO_AUTO
 from .erros import FalhaTriagem
-from .modelos import Chamado, ErroTriagem
+from .modelos import Chamado, ErroTriagem, Relatorio
+from .persistencia import Registro
 from .servico import Triador
 from .simulado import ClienteSimulado
 
 SAIDA_OK, SAIDA_FALHA, SAIDA_CONFIG = 0, 1, 2
+
+# Estratégias do --comparar: nome → valor de --modelo.
+ESTRATEGIAS = {"roteador": MODO_AUTO, "sonnet": MODELO_SONNET, "haiku": MODELO_HAIKU}
 
 
 def _data(valor: str) -> date:
@@ -31,7 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="comando", required=True)
 
     comum = argparse.ArgumentParser(add_help=False)
-    comum.add_argument("--modelo", help=f"ID do modelo (padrão: TRIAGEM_MODELO ou {MODELO_PADRAO})")
+    comum.add_argument("--modelo", help=f"'auto' (roteador) ou ID do modelo (padrão: TRIAGEM_MODELO ou {MODELO_PADRAO})")
     comum.add_argument("--saida", help="Grava o JSON neste arquivo em vez do stdout")
     comum.add_argument("--simulado", action="store_true", help="Usa um cliente falso, sem chamar a API")
     comum.add_argument("--debug", action="store_true", help="Mostra o stack trace no stderr em erro interno")
@@ -47,6 +51,8 @@ def _parser() -> argparse.ArgumentParser:
     aval = sub.add_parser("avaliar", parents=[comum], help="Avalia contra o gabarito")
     aval.add_argument("--arquivo", required=True, help="JSON com chamados e gabarito")
     aval.add_argument("--repeticoes", type=int, default=1, help="Rodadas para medir estabilidade (padrão 1)")
+    aval.add_argument("--comparar", action="store_true",
+                      help="Roda roteador, sempre-Sonnet e sempre-Haiku e compara custo e acerto")
     return parser
 
 
@@ -64,9 +70,14 @@ def _preencher_data(chamados: list[Chamado], padrao: date | None) -> None:
             chamado.data_referencia = padrao
 
 
-def _triador(args: argparse.Namespace, chamados: list[Chamado]) -> Triador:
-    cliente = ClienteSimulado.do_gabarito(chamados) if args.simulado else None
-    return Triador(args.modelo, cliente=cliente)
+def _triador(
+    args: argparse.Namespace,
+    chamados: list[Chamado],
+    modelo: str | None = None,
+    registro: Registro | None = None,
+) -> Triador:
+    cliente = ClienteSimulado.por_modelo(chamados) if args.simulado else None
+    return Triador(modelo or args.modelo, cliente=cliente, registro=registro)
 
 
 def _classificar(args: argparse.Namespace) -> int:
@@ -77,7 +88,8 @@ def _classificar(args: argparse.Namespace) -> int:
     # Na classificação do dia a dia, "hoje" é a data local (RF-09).
     _preencher_data(chamados, args.data_referencia or date.today())
 
-    triador = _triador(args, chamados)
+    # classificar grava no histórico (TRIAGEM_DB=off desliga); avaliar nunca grava.
+    triador = _triador(args, chamados, registro=Registro.do_ambiente())
     resultados = [triador.triar_chamado(chamado) for chamado in chamados]
     saida = [r.model_dump(mode="json") for r in resultados]
     _escrever(saida if era_lista else saida[0], args.saida)
@@ -94,17 +106,33 @@ def _avaliar(args: argparse.Namespace) -> int:
     # Sem padrão de relógio: a avaliação tem que dar o mesmo resultado em qualquer dia.
     _preencher_data(chamados, args.data_referencia)
 
-    triador = _triador(args, chamados * args.repeticoes)
+    if args.comparar:
+        if args.modelo:
+            raise entrada.ErroEntrada("--comparar não aceita --modelo: ele roda as três estratégias")
+        relatorios = {nome: _rodar(args, chamados, modelo) for nome, modelo in ESTRATEGIAS.items()}
+        resultado = comparar(relatorios)
+        _escrever(resultado.model_dump(mode="json"), args.saida)
+        if resultado.aviso:
+            print(resultado.aviso, file=sys.stderr)
+        # Exit pelo veredito comparativo: metas do roteador + economia e acerto vs Sonnet.
+        return SAIDA_OK if resultado.comparacao.aprovado else SAIDA_FALHA
+
+    relatorio = _rodar(args, chamados, args.modelo)
+    _escrever(relatorio.model_dump(mode="json"), args.saida)
+    if relatorio.aviso:
+        print(relatorio.aviso, file=sys.stderr)
+    return SAIDA_OK if relatorio.aprovado else SAIDA_FALHA
+
+
+def _rodar(args: argparse.Namespace, chamados: list[Chamado], modelo: str | None) -> Relatorio:
+    """Uma estratégia, N rodadas, sem gravar no histórico."""
+    triador = _triador(args, chamados, modelo)
     rodadas = [
         [triador.triar_chamado(chamado) for chamado in chamados]
         for _ in range(args.repeticoes)
     ]
     estaveis = estabilidade(rodadas) if args.repeticoes > 1 else None
-    relatorio = avaliar(chamados, rodadas[0], triador.modelo, estaveis)
-    _escrever(relatorio.model_dump(mode="json"), args.saida)
-    if relatorio.aviso:
-        print(relatorio.aviso, file=sys.stderr)
-    return SAIDA_OK if relatorio.aprovado else SAIDA_FALHA
+    return avaliar(chamados, rodadas[0], triador.modelo, estaveis, simulado=args.simulado)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -460,3 +460,374 @@ Só `texto` é obrigatório (1 a 8.000 caracteres). O modelo é **configurado no
     - Os testes atuais de CLI devem passar sem mudança.
 11. **`docs/exemplos.json`:** `data_referencia` nos 10 itens, depois do OK da Alice.
 12. **README:** seção "Usar como biblioteca" (3 linhas) e "Subir a API local" (2 comandos).
+
+---
+
+## 14. Produção: roteador de modelos, persistência, estatísticas e deploy
+
+> Adicionada em 05/10/2026. Baseada no código da versão 0.2.0 (`servico.py`, `classificador.py`, `simulado.py`, `web.py`). Tudo aqui precisa rodar **sem API** (`--simulado` / `TRIAGEM_SIMULADO=1`). Ainda não há código; a implementação fica com o Rafa.
+
+### 14.1 Roteador de modelos (Haiku padrão, Sonnet nos casos difíceis)
+
+**Fluxo de um chamado no modo `auto`:**
+
+```
+chamado ──► decidir_modelo() ──► texto longo? ── sim ──► Sonnet ─────────────────────────────► resultado
+                                     │ não
+                                     ▼
+                                   Haiku ──► deve_escalar()? ── não ──► resultado (Haiku)
+                                                   │ sim (confiança baixa, prioridade escalável, falha de validação)
+                                                   ▼
+                                                 Sonnet ──► resultado (Sonnet). Se o Sonnet falhar na API → resultado do Haiku, marcado
+```
+
+**Modo:** `TRIAGEM_MODELO` / `--modelo` passa a aceitar `auto` além dos IDs. `auto` é o roteador; um ID fixa o modelo, como hoje. **Padrão: `auto`, já nesta fase** (decisão do Theo em 05/10/2026, a pedido do usuário). Isso substitui o padrão `claude-sonnet-5-5` do RF-05 do PRD e da §4. A Alice deve atualizar o PRD.
+- **Critério de reversão:** se o `avaliar --comparar` **real** (§14.6, item 10) mostrar o roteador **reprovado** (acerto conjunto < 8/10) **ou** com **algum** crítico subestimado, o padrão volta para `claude-sonnet-5-5`. A volta é uma mudança de uma constante (`config.MODELO_PADRAO`) e é registrada no README com o relatório que a motivou. Até essa medição, `auto` é o padrão **provisório**.
+
+#### Confiança: como obter e qual limiar
+
+O schema atual não tem confiança. Proposta: um campo novo em `Triagem`, **depois** de `justificativa`, para o modelo justificar antes de se autoavaliar:
+
+```python
+class Confianca(str, Enum):
+    alta = "alta"; media = "media"; baixa = "baixa"
+
+class Triagem(BaseModel):
+    ...
+    justificativa: str
+    confianca: Confianca   # novo; entra no JSON Schema enviado à API
+```
+
+- **Por que categórico e não um número (0–1):** uma probabilidade autodeclarada por LLM é mal calibrada e passa uma falsa precisão. Três níveis com critério escrito são mais estáveis entre execuções e mais fáceis de auditar. A API não dá logprobs, então não há confiança "de verdade" para extrair.
+- **Critério no `prompts/sistema.md`** (nova seção "Confiança"):
+  - `alta`: o texto encaixa num único critério, sem desempate.
+  - `media`: precisou de uma regra de desempate, mas o texto tem os fatos necessários.
+  - `baixa`: duas categorias ou duas prioridades continuam plausíveis, ou falta informação que muda a prioridade (quantos usuários, se há contorno, qual o prazo).
+- **Limiar:** `confianca_minima = "media"`. Escala quando a confiança vem `baixa`. Pode ser configurado como `alta`, que escala `media` e `baixa`.
+- **Calibração medida, não presumida:** o `avaliar` reporta o acerto do Haiku por nível de confiança (`acerto_por_confianca`). Se `baixa` não errar mais que `alta`, o campo não serve como sinal, e o limiar ou o critério precisa mudar.
+- `confianca` também sai na resposta pública. Como é um campo **novo**, é uma mudança compatível: versão 0.3.0 e nota no README.
+
+#### Regra configurável e funções puras (`src/triagem/roteador.py`)
+
+> Alinhado ao código em 05/10/2026. **`roteador.py` e `config.py` são a fonte da verdade** para nomes de constantes, variáveis de ambiente e níveis de confiança. Se este texto divergir deles, vale o código.
+
+```python
+# config.py
+MODELO_SONNET = "claude-sonnet-5-5"
+MODELO_HAIKU  = "claude-haiku-4-5-20251001"
+MODO_AUTO     = "auto"
+MODELO_PADRAO = MODO_AUTO                                   # critério de reversão: volta para MODELO_SONNET
+MODELOS_SUPORTADOS = (MODO_AUTO, MODELO_SONNET, MODELO_HAIKU)   # aceitos em --modelo / TRIAGEM_MODELO
+# Config.eh_auto / Config.eh_haiku
+
+# roteador.py
+MotivoEscalonamento = Literal["confianca_baixa", "prioridade", "falha_validacao"]
+
+@dataclass(frozen=True)
+class RegraRoteamento:
+    modelo_base: str = MODELO_HAIKU
+    modelo_forte: str = MODELO_SONNET
+    max_caracteres: int = 1500                      # pré-roteamento: len(chamado.texto) — SÓ o texto
+    confianca_minima: Confianca = Confianca.media   # confiança abaixo deste nível escala
+    prioridades_escalaveis: frozenset[Prioridade] = field(
+        default_factory=lambda: frozenset({Prioridade.critica}))
+    escalar_em_falha_validacao: bool = True         # modelo base esgotou as 2 tentativas → forte
+
+    @classmethod
+    def do_ambiente(cls, ambiente: Mapping[str, str] | None = None) -> "RegraRoteamento": ...
+        # lê TRIAGEM_ROTEADOR_* (de `ambiente` nos testes, de os.environ por padrão); inválido → ErroConfiguracao
+    def descrever(self) -> dict: ...                # regra serializável (usada pelo /v1/saude)
+
+@dataclass(frozen=True)
+class Decisao:
+    modelo: str
+    motivo: Literal["padrao", "texto_longo"]
+
+def decidir_modelo(chamado: Chamado, regra: RegraRoteamento) -> Decisao: ...
+def deve_escalar(resultado: ResultadoTriagem | ErroTriagem, regra: RegraRoteamento) -> MotivoEscalonamento | None:
+    # ordem: falha de validação (se habilitada) → confiança abaixo do mínimo → prioridade escalável
+    # Erros de API (limite_taxa, timeout...) e recusa NÃO escalam: devolvem o erro.
+```
+
+**Níveis de confiança** (`modelos.Confianca`): `alta`, `media`, `baixa`, ordenados `baixa < media < alta`. Escala quando `confianca < confianca_minima`. Com o padrão `media`, só `baixa` escala.
+
+**O modo fixo não passa pelo roteador.** Com `--modelo <ID>`, o `Triador` não tem regra (`_regra is None`) e chama o modelo direto. Por isso `Decisao` não tem motivo `modelo_fixo`.
+
+`decidir_modelo` e `deve_escalar` não fazem I/O, não leem o ambiente e não leem o relógio. Isso permite testar cada regra com tabela (`pytest.mark.parametrize`). A única função que lê o ambiente é `do_ambiente`, e ela aceita um `Mapping` para teste.
+
+**De onde vem a regra** (a primeira encontrada vale): parâmetro `Triador(regra=RegraRoteamento(...))` > variáveis de ambiente > padrões da dataclass.
+
+| Variável | Padrão |
+|---|---|
+| `TRIAGEM_ROTEADOR_MAX_CARACTERES` | `1500` |
+| `TRIAGEM_ROTEADOR_CONFIANCA_MINIMA` | `media` |
+| `TRIAGEM_ROTEADOR_PRIORIDADES` | `critica` (lista separada por vírgula, ex.: `critica,alta`) |
+
+Todos os valores aceitam maiúsculas e minúsculas. `MAX_CARACTERES` precisa ser um inteiro ≥ 1; `CONFIANCA_MINIMA` aceita `alta`, `media` ou `baixa`; `PRIORIDADES` aceita `critica`, `alta`, `media` e `baixa`.
+
+Um arquivo de configuração fica fora: com 3 valores, variáveis de ambiente bastam e evitam um parser a mais.
+
+**Os valores iniciais são chutes a calibrar:**
+- **1.500 caracteres, contando só o `texto`.** O `assunto` fica de fora: é curto e não muda a dificuldade (decisão do Theo em 05/10/2026, mantida no código). Os 10 exemplos têm de 150 a 330 caracteres de texto, e o PRD supõe até cerca de 2.000. Texto longo tende a misturar assuntos (desempate 3).
+- ⚠️ **`critica` escalável só corrige alarme falso.** Se o Haiku diz `critica`, o Sonnet confirma ou rebaixa. O erro grave do PRD, porém, é o **contrário**: um crítico classificado como `media` ou `baixa`, e esse caso só escala se o Haiku declarar confiança baixa. Por isso, a métrica `criticos_subestimados` do **roteador** é o que decide. Se der > 0, acrescentar `alta` a `TRIAGEM_ROTEADOR_PRIORIDADES` antes de mexer no resto.
+
+#### Onde fica a orquestração
+
+- **`classificador.classificar()` não muda.** Ele já recebe um `Config`, e o roteador chama `classificar(chamado, cliente, dataclasses.replace(config, modelo=...))` uma vez por modelo. `Config.eh_haiku` continua escolhendo os parâmetros certos de cada modelo.
+- **`servico.Triador.triar_chamado()`** passa a orquestrar: `decidir_modelo` → `classificar` → `deve_escalar` → `classificar` de novo, se for o caso → montar `meta` → gravar o registro (§14.2).
+- **`config.carregar()`** aceita `MODO_AUTO` (`"auto"`). `Triador.modelo` devolve `"auto"`, e `Triador.regra` devolve a regra em uso. O `/v1/saude` mostra o modo e `regra.descrever()`.
+
+#### Custo e `meta` com duas chamadas
+
+`meta` ganha o bloco `roteamento`. Os campos de topo passam a ser **totais**:
+
+```json
+"meta": {
+  "modelo": "claude-sonnet-5-5",
+  "latencia_ms": 5200,
+  "tokens_entrada": 3350,
+  "tokens_saida": 760,
+  "custo_usd": 0.01103,
+  "data_referencia": "2026-10-05",
+  "roteamento": {
+    "modo": "auto",
+    "modelo_inicial": "claude-haiku-4-5-20251001",
+    "escalado": true,
+    "motivo": "confianca_baixa",
+    "chamadas": [
+      {"modelo": "claude-haiku-4-5-20251001", "tokens_entrada": 1600, "tokens_saida": 280, "custo_usd": 0.0030, "latencia_ms": 1400},
+      {"modelo": "claude-sonnet-5-5",          "tokens_entrada": 1750, "tokens_saida": 480, "custo_usd": 0.0083, "latencia_ms": 3800}
+    ]
+  }
+}
+```
+
+- `meta.modelo` é o modelo da resposta **final**.
+- **Regra de custo (decisão do Theo, 05/10/2026): o custo soma TODAS as chamadas pagas, inclusive as que falharam.** Cada chamada é cobrada pelo preço do modelo que respondeu; não é a soma de tokens multiplicada por um preço só. Toda chamada que devolveu `usage` entra em `roteamento.chamadas` e nos totais, mesmo que o resultado dela tenha sido descartado:
+
+  | Situação | Entra no custo? |
+  |---|---|
+  | Haiku respondeu e foi a resposta final | sim |
+  | Haiku respondeu, mas escalou (confiança/prioridade) | sim, **mais** o Sonnet |
+  | Haiku falhou na validação após 2 tentativas e escalou | **sim**: as 2 tentativas foram pagas, mais o Sonnet |
+  | Recusa (`stop_reason = refusal`) | **sim**: a API devolve `usage` |
+  | Sonnet (escalada) falhou na validação; fica a resposta do Haiku | **sim**: Haiku mais as tentativas do Sonnet |
+  | Erro de API sem resposta (429, timeout, conexão, 5xx) | não: não há `usage`, e a API não cobra |
+
+- O mesmo vale quando o **resultado final é um erro**: um `ErroTriagem` que consumiu tokens tem custo, e esse custo vai para o registro (§14.2) e para o `custo_total_usd` do `avaliar`.
+- ⚠️ **Divergência no código atual (05/10/2026), tarefa do Rafa:** `servico.py` monta `roteamento.chamadas` só com resultados `ResultadoTriagem`, filtrando com `isinstance(r, ResultadoTriagem)` em `triar_chamado`. Assim, tentativas pagas que terminaram em `ErroTriagem` (validação ou recusa) somem do custo. A correção: `classificar()` passa a anexar o consumo também ao `ErroTriagem` (um campo `consumo: ChamadaModelo | None`, com tokens, custo e latência acumulados nas tentativas), e `triar_chamado` monta `chamadas` a partir de **todas** as tentativas com consumo.
+- `latencia_ms` é a soma das latências de todas as chamadas, que é o que o usuário espera.
+- Se alguma chamada tiver custo `None` (modelo de fallback fora da tabela de preços), o total também vira `None`, mantendo a regra atual.
+- No modo fixo, `roteamento` traz `modo: "fixo"`, `escalado: false` e as chamadas daquele modelo.
+- Se a escalada falhar, a resposta é a do Haiku com `escalado: false` e `motivo` igual a `"<motivo> (falhou: <tipo>)"`. As chamadas pagas do Sonnet que falhou continuam no custo, conforme a tabela acima.
+
+#### Comparação no `avaliar`
+
+- `triagem avaliar --arquivo docs/exemplos.json --comparar` roda as três estratégias sobre o mesmo arquivo: `roteador` (auto), `sonnet` (fixo) e `haiku` (fixo).
+- Custo real estimado: cerca de US$ 0,15 por execução completa (30 chamados mais as escaladas).
+
+```json
+{
+  "simulado": false,
+  "comparacao": [
+    {"estrategia": "roteador", "acerto_conjunto": 9, "criticos_subestimados": 0, "aprovado": true,
+     "custo_total_usd": 0.046, "custo_medio_usd": 0.0046, "latencia_p95_ms": 6100,
+     "taxa_escalonamento": 0.3, "escalonamentos_por_motivo": {"confianca_baixa": 2, "prioridade": 1}},
+    {"estrategia": "sonnet", "...": "..."},
+    {"estrategia": "haiku",  "...": "..."}
+  ],
+  "relatorios": {"roteador": { "...Relatorio completo..." }, "sonnet": {}, "haiku": {}},
+  "aviso": null
+}
+```
+
+- **`Relatorio` ganha três campos:** `taxa_escalonamento`, `escalonamentos_por_motivo` e `acerto_por_confianca`. Os dois primeiros só fazem sentido no modo `auto`.
+- **Código de saída** do `--comparar`: 0 se o **roteador** for aprovado, 1 se não.
+- `--comparar` é incompatível com `--modelo`; com `--repeticoes N`, cada estratégia roda N vezes.
+
+#### Simulado por modelo (comparação de custo demonstrável)
+
+Problema no simulado atual: o `ClienteSimulado.do_gabarito` responde **por ordem de fila**. Com o roteador, o número de chamadas por chamado varia (1 ou 2), e a fila sai de sincronia. O simulado novo responde **por conteúdo**:
+
+- `ClienteSimulado.por_modelo(chamados, perfis=PERFIS_PADRAO)` acha o chamado procurando o `texto` dele na mensagem do usuário recebida em `kwargs["messages"]`. Para isso, monta um dicionário texto → chamado.
+- **Resposta:** o gabarito, quando existe. Sem gabarito, a triagem fixa. **O mesmo vale para os dois modelos.**
+- **Tokens plausíveis por modelo** (`PerfilSimulado` por ID), todos determinísticos, sem `random`:
+  - Entrada: `prompt_base + len(texto) // 4`, com `prompt_base` ≈ 1.450, o tamanho medido do system prompt atual.
+  - Saída: Haiku ≈ 260; Sonnet ≈ 260 + 220 de raciocínio com esforço `low`.
+  - Variação de ±10% derivada de `sha256(texto)`, para o resultado se repetir de uma execução para outra.
+  - Esses números devem ser recalibrados com os `usage` médios da primeira avaliação real.
+- **Confiança simulada** (só no Haiku): `baixa` em cerca de 30% dos chamados, escolhidos por `sha256(texto) % 10 < 3`. No resto, `alta`. O Sonnet simulado sempre responde `alta`. Assim, as taxas de escalonamento e o custo combinado aparecem no relatório.
+- **Latência:** não é simulada (fica ≈ 0 ms). `latencia_p95_ms` no simulado não significa nada.
+- **Aviso obrigatório no relatório** (`"simulado": true` e `aviso`, também no stderr): "Modo simulado: as respostas vêm do gabarito e a confiança e os tokens são fictícios por perfil de modelo. Este relatório demonstra o fluxo e a conta de custo do roteador; **não mede acerto nem latência**. Para decidir, rode sem `--simulado`."
+- Com o gabarito como resposta, o simulado sempre dá 10/10 nas três estratégias. É por isso que ele **não prova acerto**.
+
+### 14.2 Persistência (`src/triagem/persistencia.py`, novo; só `sqlite3` da stdlib)
+
+- **Caminho:** `TRIAGEM_DB`, com padrão `data/triage.db` (relativo ao diretório de execução). `TRIAGEM_DB=off` desliga.
+- **Quem grava:**
+  - `POST /v1/triagem` grava (decisão do Theo).
+  - `triagem classificar` grava, inclusive com `--simulado` (linhas com `simulado = 1`). Para não gravar, use `TRIAGEM_DB=off`.
+  - `triagem avaliar` **nunca** grava, nem com `--comparar`, para não poluir as estatísticas com o gabarito.
+  - Os testes **sempre** apontam `TRIAGEM_DB` para `tmp_path` ou `off`, com uma fixture `autouse` no `conftest.py`, para nunca escrever em `data/`.
+- **Criação do banco:** `mkdir(parents=True, exist_ok=True)` na pasta, `PRAGMA journal_mode=WAL` e schema idempotente. Acrescentar `data/` ao `.gitignore`.
+- **Injeção:** `Triador(registro: Registro | None = None)`. Sem registro, nada é gravado. A gravação acontece no fim de `Triador.triar_chamado()`, um ponto único que cobre CLI, web e lote.
+
+```sql
+CREATE TABLE IF NOT EXISTS triagens (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  criado_em            TEXT    NOT NULL,             -- ISO 8601 UTC
+  chamado_id           TEXT,
+  canal                TEXT,
+  texto_hash           TEXT    NOT NULL,             -- HMAC-SHA256(assunto + "\n" + texto)
+  texto_tamanho        INTEGER NOT NULL,
+  texto                TEXT,                         -- NULL, exceto com TRIAGEM_DB_GUARDAR_TEXTO=1
+  data_referencia      TEXT,
+  status               TEXT    NOT NULL CHECK (status IN ('ok', 'erro')),
+  erro_tipo            TEXT,
+  categoria            TEXT,
+  prioridade           TEXT,
+  confianca            TEXT,
+  modo                 TEXT    NOT NULL,             -- 'auto' | 'fixo'
+  modelo_inicial       TEXT,
+  modelo_final         TEXT,
+  escalado             INTEGER NOT NULL DEFAULT 0,
+  motivo_roteamento    TEXT,                         -- 'texto_longo' | 'confianca_baixa' | 'prioridade' | 'falha_validacao' | NULL
+  tokens_entrada       INTEGER,
+  tokens_saida         INTEGER,
+  custo_usd            REAL,
+  latencia_ms          INTEGER,
+  simulado             INTEGER NOT NULL DEFAULT 0,
+  versao               TEXT    NOT NULL              -- triagem.__version__
+);
+CREATE INDEX IF NOT EXISTS idx_triagens_criado_em ON triagens (criado_em);
+PRAGMA user_version = 1;   -- migrações futuras comparam este número
+```
+
+**Privacidade:**
+- Nunca grava a chave da API nem nada que venha de `Config`.
+- Também não grava `resumo` nem `resposta_sugerida`, porque derivam do texto e podem carregar dados pessoais.
+- O hash usa **HMAC com `TRIAGEM_HASH_SEGREDO`**: um SHA-256 simples de texto curto pode ser revertido por força bruta. Sem o segredo, o código usa SHA-256 simples e registra um aviso no log uma única vez.
+- O hash permite contar chamados repetidos sem guardar o texto.
+
+**A gravação nunca derruba a triagem:**
+- `Registro.gravar(chamado, resultado) -> bool` captura `sqlite3.Error` e `OSError`, registra `log.warning` sem o texto e devolve `False`.
+- A conexão é aberta **a cada gravação**, com `sqlite3.connect(caminho, timeout=2)`. Isso é simples e seguro no threadpool do FastAPI, e o volume de uma pequena empresa não pede pool.
+- Se o banco não puder ser criado no startup, o servidor **sobe sem persistência**, com um aviso no log e `"banco": {"ativo": false}` no `/v1/stats`.
+- Linhas do modo simulado são gravadas com `simulado = 1`.
+
+**O que é gravado:** triagens com sucesso e com erro de API ou modelo (`status = 'erro'`, `erro_tipo`). Erros de **entrada** (422) não são gravados, porque não há chamado válido.
+
+**Testes** (`tests/test_persistencia.py`, com banco em `tmp_path / "t.db"`, nunca em `data/`):
+- Grava e lê de volta.
+- O schema é idempotente: criar duas vezes não dá erro.
+- **O texto bruto não aparece em lugar nenhum do banco:** procurar os bytes do texto no arquivo `.db` e no `-wal`.
+- `TRIAGEM_DB_GUARDAR_TEXTO=1` grava o texto.
+- **Falha não propaga:** com o caminho apontando para uma pasta, ou com `sqlite3.connect` substituído por um mock que levanta exceção, `gravar` devolve `False` e o `Triador.triar()` devolve o resultado normalmente.
+- O startup sem banco funciona.
+
+### 14.3 `GET /v1/stats`
+
+- **Parâmetros opcionais:** `desde` e `ate` (datas ISO, intervalo fechado sobre `criado_em`) e `simulado` (`0` ou `1`; sem ele, conta tudo).
+- **Cálculo:** as agregações são `COUNT`/`SUM` com `GROUP BY` no SQLite. Os percentis são calculados em Python sobre a coluna `latencia_ms`, porque o SQLite não tem percentil. Para isso, `avaliacao.p95` vira `percentil(valores, p)`, reaproveitado aqui. É suficiente para o volume do MVP.
+
+```json
+{
+  "periodo": {"desde": null, "ate": null},
+  "tickets": 128,
+  "ok": 125,
+  "erros": 3,
+  "erros_por_tipo": {"limite_taxa": 2, "validacao": 1},
+  "simulados": 0,
+  "custo_total_usd": 0.4213,
+  "custo_medio_usd": 0.0034,
+  "custos_desconhecidos": 0,
+  "por_categoria":  {"acesso": 21, "cobranca": 18, "bug_tecnico": 40, "duvida_uso": 30, "sugestao": 9, "outro": 7},
+  "por_prioridade": {"critica": 6, "alta": 19, "media": 41, "baixa": 59},
+  "por_modelo":     {"claude-haiku-4-5-20251001": 97, "claude-sonnet-5-5": 28},
+  "roteamento": {
+    "pre_roteados": 5,
+    "iniciados_no_haiku": 120,
+    "escalados": 23,
+    "taxa_escalonamento": 0.19,
+    "por_motivo": {"confianca_baixa": 12, "prioridade": 9, "falha_validacao": 2}
+  },
+  "latencia_ms": {"p50": 1800, "p95": 6100},
+  "banco": {"ativo": true}
+}
+```
+
+- `por_categoria`, `por_prioridade` e `por_modelo` (pelo modelo final) contam só as linhas `ok`. As seis categorias e as quatro prioridades sempre aparecem, mesmo com zero.
+- `taxa_escalonamento = escalados / iniciados_no_haiku`. É `null` quando o divisor é 0. Os pré-roteados não entram, porque não passaram pelo Haiku.
+- `custo_total_usd` soma `custo_usd` e ignora `NULL`, que é contado em `custos_desconhecidos`.
+- `latencia_ms` usa só as linhas `ok`; sem dados, `p50` e `p95` são `null`.
+- **Erros:**
+  - Persistência desligada ou banco indisponível → **503** `{"erro": {"tipo": "configuracao", "mensagem": "Persistência desligada"}}`.
+  - Data inválida → 422, pelo handler que já existe.
+- A resposta não traz texto, hash nem ID de chamado; são só agregados. A rota continua restrita a `127.0.0.1`, como o resto da API (§13.4).
+- **Testes** (`test_web.py`): `TestClient` + `Triador` simulado + `Registro(tmp_path)`. Triar 3 chamados, chamar `/v1/stats` e conferir contagens, custo somado, taxa e o 503 sem banco.
+
+### 14.4 Deploy da demo estática (`web/`)
+
+- **O que vai para a Vercel:** só `web/`, uma página estática. Hoje a pasta **não existe**, e o `index.html` ainda vai ser criado. **A API Python e o SQLite não vão para a Vercel.** O sistema de arquivos de funções serverless é efêmero, então o banco se perderia a cada execução, e a chave da API teria que sair da máquina. O backend continua local (§13.4).
+- **Como a demo funciona sem backend:** por padrão, a página mostra resultados pré-gerados em `web/dados/exemplos-simulados.json`, produzidos com `triagem classificar --arquivo docs/exemplos.json --simulado`, rodado com `TRIAGEM_DB=off` para não gravar no banco. Opcionalmente, ela aceita a URL de uma API local. Nesse caso, essa API precisa de `TRIAGEM_CORS_ORIGENS=https://<projeto>.vercel.app`. Nada de chave em `web/`.
+- **Publicar a partir de `web/` como raiz do projeto Vercel.** Se o deploy partisse da raiz do repositório, subiria tudo o que está nela: `.venv`, `data/`, `docs/` e arquivos pessoais que dividem a pasta (CV, `DUBLIN.md`...). Por isso, o `vercel.json` fica **dentro** de `web/`:
+
+```json
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": null,
+  "outputDirectory": ".",
+  "cleanUrls": true,
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {"key": "X-Content-Type-Options", "value": "nosniff"},
+        {"key": "Referrer-Policy", "value": "no-referrer"}
+      ]
+    }
+  ]
+}
+```
+
+- **`.vercelignore` na raiz do repositório bloqueia o deploy da raiz.** O conteúdo é uma linha só, `*`. Se alguém rodar `vercel deploy` na raiz por engano, nada é enviado: nem `.venv`, nem `data/`, nem `docs/`, nem os arquivos pessoais. O deploy a partir de `web/` não é afetado, porque a Vercel só lê o `.vercelignore` da pasta que é a raiz do projeto, aqui `web/`.
+  ```
+  # .vercelignore (raiz do repositório): a demo é publicada a partir de web/, nunca daqui
+  *
+  ```
+- **Comando de deploy** (PowerShell, a partir da raiz do repositório). Na primeira vez, `--yes` cria e vincula o projeto com os padrões; a pasta `web/.vercel/` gerada vai para o `.gitignore`.
+  ```powershell
+  cd web; vercel deploy --prod --yes
+  ```
+- **Antes do deploy, conferir:** `web/` contém só `index.html`, os assets e `dados/*.json` simulados. Sem `.env`, sem `.db`, sem dados reais.
+
+### 14.5 Riscos desta fase
+
+| Risco | Mitigação |
+|---|---|
+| Confiança autodeclarada mal calibrada | `acerto_por_confianca` no `avaliar`. Se não discriminar, ajustar o critério ou o limiar, ou escalar por prioridade. |
+| O roteador subestimar um crítico (Haiku diz `media` com confiança `alta`) | Critério de reversão: com 1 crítico subestimado ou reprovação no `--comparar` real, o padrão volta para `claude-sonnet-5-5`. Depois, testar `alta` nas prioridades escaláveis antes de tentar `auto` de novo. |
+| O simulado ser lido como prova de acerto | `"simulado": true` + aviso no JSON e no stderr. A decisão só vale com uma execução real. |
+| Disputa de escrita no SQLite com várias threads | WAL + `timeout=2` + gravação que falha em silêncio. Acima de alguns req/s, trocar por fila ou Postgres (fase 2). |
+| Hash reversível de texto curto | HMAC com `TRIAGEM_HASH_SEGREDO` em produção. |
+| Deploy publicar arquivos pessoais | Deploy a partir de `web/`, nunca da raiz. O `.vercelignore` com `*` na raiz bloqueia um deploy da raiz feito por engano. |
+| Custo subestimado quando a tentativa falha | Regra "todas as chamadas pagas entram no custo" (§14.1), com teste de validação que falha e depois escala. |
+
+### 14.6 Tarefas do Rafa (nesta ordem)
+
+1. **`modelos.py`:** `Confianca` e `Triagem.confianca`, depois de `justificativa`. `Meta.roteamento` (`Roteamento`, `ChamadaModelo`). Em `Relatorio`: `simulado`, `taxa_escalonamento`, `escalonamentos_por_motivo`, `acerto_por_confianca`.
+2. **`prompts/sistema.md`:** a seção "Confiança" (§14.1) e o campo nos 3 exemplos few-shot.
+3. **`roteador.py`:** `RegraRoteamento` (+ `do_ambiente`), `Decisao`, `decidir_modelo` e `deve_escalar`. **`tests/test_roteador.py`** com tabela de casos: texto no limite de caracteres, cada nível de confiança × limiar, `critica`/`alta`, falha de validação que escala, limite de taxa e recusa que não escalam, variáveis de ambiente inválidas. O limite de caracteres é testado **só com o `texto`**: um assunto longo com texto curto não pré-roteia.
+4. **`config.py`:** aceitar `auto`; constante `MODELO_SONNET`; `MODELO_PADRAO = "auto"` **já agora**. Ajustar os testes que assumem o Sonnet como padrão.
+5. **`servico.py`:** `Triador(regra=..., registro=...)`, orquestração, soma de custo e latência, escalada que falha devolvendo o resultado do Haiku. **`tests/test_servico.py`:** custo = soma das duas chamadas a preços diferentes; `meta.roteamento` em cada caminho.
+   - **Pendente (05/10/2026):** custo de chamadas pagas que falharam (§14.1, tabela de custo). Em `classificador.py`, acrescentar `ErroTriagem.consumo` com tokens, custo e latência das tentativas. Em `servico.py`, `roteamento.chamadas` passa a incluir **todas** as tentativas com consumo, sem o filtro `isinstance(r, ResultadoTriagem)`. Testes: Haiku inválido 2× e Sonnet ok (custo = 2 tentativas do Haiku + Sonnet); recusa com custo; escalada que falha na validação (custo do Sonnet entra, resposta do Haiku); 429 sem custo.
+6. **`simulado.py`:** `PerfilSimulado`, `ClienteSimulado.por_modelo` (resposta por conteúdo, tokens e confiança determinísticos). A CLI e o `TRIAGEM_SIMULADO=1` passam a usá-lo. Manter `do_gabarito` e `fixo` para os testes atuais.
+7. **`persistencia.py`** (`Registro`, `gravar`, `estatisticas`) + gravação em `classificar` (nunca em `avaliar`) + `TRIAGEM_DB`, `TRIAGEM_DB_GUARDAR_TEXTO` e `TRIAGEM_HASH_SEGREDO`. **`tests/test_persistencia.py`.** Acrescentar `data/` e `.vercel/` ao `.gitignore`.
+8. **`avaliacao.py` + `cli.py`:** `percentil(valores, p)`, `--comparar` e o aviso do simulado.
+9. **`web.py`:** `GET /v1/stats`, criação do `Registro` no lifespan (falha → sem persistência) e `/v1/saude` com o modo e a regra. Testes em `test_web.py`.
+10. **Primeira medição real:** `triagem avaliar --arquivo docs/exemplos.json --comparar`, com custo estimado de US$ 0,15.
+    - Registrar no README acerto, críticos subestimados, custo e p95 por estratégia, e calibrar os tokens do `PerfilSimulado`.
+    - **Aplicar o critério de reversão (§14.1):** roteador reprovado ou com algum crítico subestimado → `MODELO_PADRAO` volta para `claude-sonnet-5-5`. Aprovado → `auto` deixa de ser provisório.
+11. **`web/`:** `index.html` (com a Alice ou quem fizer a interface), `dados/exemplos-simulados.json` e `vercel.json` (§14.4). **`.vercelignore` na raiz** com `*` (ainda não existe). `web/.vercel/` no `.gitignore`. O deploy, `cd web; vercel deploy --prod --yes`, só acontece com o OK do Theo.
+12. **README:** variáveis novas, `--comparar`, `/v1/stats` e o comando de deploy.

@@ -21,7 +21,7 @@ def test_saude():
     with _cliente_http() as http:
         r = http.get("/v1/saude")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "modelo": "claude-sonnet-5-5"}
+    assert r.json() == {"status": "ok", "modelo": "claude-sonnet-5-5", "regra": None, "persistencia": False}
 
 
 def test_triagem_200(triagem_valida):
@@ -148,3 +148,86 @@ def test_max_retries_invalido_e_erro_de_configuracao(monkeypatch, valor):
     with pytest.raises(ErroConfiguracao, match="TRIAGEM_MAX_RETRIES"):
         with TestClient(criar_app()):
             pass
+
+
+def _app_com_banco(tmp_path, fila):
+    from triagem.persistencia import Registro
+
+    registro = Registro(tmp_path / "t.db")
+    triador = Triador("auto", cliente=ClienteSimulado(fila), registro=registro)
+    return TestClient(criar_app(triador))
+
+
+def test_stats_depois_de_tres_triagens(tmp_path, triagem_valida):
+    from triagem.modelos import Confianca, Prioridade
+
+    media = triagem_valida.model_copy(update={"prioridade": Prioridade.media})
+    baixa = media.model_copy(update={"confianca": Confianca.baixa})
+    fila = [
+        resposta(media, tokens_entrada=1000, tokens_saida=100),
+        resposta(baixa, tokens_entrada=1000, tokens_saida=100), resposta(media, tokens_entrada=1000, tokens_saida=100),
+        resposta(media, tokens_entrada=1000, tokens_saida=100),
+    ]
+    with _app_com_banco(tmp_path, fila) as http:
+        custos = [http.post("/v1/triagem", json={"texto": t}).json()["meta"]["custo_usd"]
+                  for t in ("um", "dois", "tres")]
+        r = http.get("/v1/stats")
+        assert http.get("/v1/saude").json()["persistencia"] is True
+    s = r.json()
+    assert r.status_code == 200
+    assert s["tickets"] == 3 and s["ok"] == 3
+    assert s["custo_total_usd"] == pytest.approx(sum(custos))
+    assert s["roteamento"]["escalados"] == 1
+    assert s["roteamento"]["taxa_escalonamento"] == pytest.approx(1 / 3, abs=1e-4)
+    assert set(s["latencia_ms"]) == {"p50", "p95"}
+    assert "texto_hash" not in r.text and "um" not in s
+
+
+def test_stats_filtros_e_data_invalida(tmp_path):
+    with _app_com_banco(tmp_path, []) as http:
+        assert http.get("/v1/stats", params={"desde": "2026-10-01", "ate": "2026-10-31", "simulado": 1}).status_code == 200
+        r = http.get("/v1/stats", params={"desde": "ontem"})
+    assert r.status_code == 422 and r.json()["erro"]["tipo"] == "entrada"
+
+
+def test_stats_sem_banco_503():
+    with _cliente_http() as http:
+        r = http.get("/v1/stats")
+    assert r.status_code == 503
+    assert r.json() == {"erro": {"tipo": "configuracao", "mensagem": "Persistência desligada"}}
+
+
+def test_startup_com_banco_quebrado_sobe_sem_persistencia(tmp_path, monkeypatch):
+    pasta = tmp_path / "pasta"
+    pasta.mkdir()
+    monkeypatch.setenv("TRIAGEM_SIMULADO", "1")
+    monkeypatch.setenv("TRIAGEM_DB", str(pasta))
+    with TestClient(criar_app()) as http:
+        assert http.post("/v1/triagem", json={"texto": "oi"}).status_code == 200
+        assert http.get("/v1/saude").json()["persistencia"] is False
+        assert http.get("/v1/stats").status_code == 503
+
+
+def test_post_grava_no_banco_do_ambiente(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRIAGEM_SIMULADO", "1")
+    monkeypatch.setenv("TRIAGEM_DB", str(tmp_path / "t.db"))
+    monkeypatch.delenv("TRIAGEM_MODELO")
+    with TestClient(criar_app()) as http:
+        http.post("/v1/triagem", json={"texto": "oi"})
+        saude = http.get("/v1/saude").json()
+        s = http.get("/v1/stats").json()
+    assert saude["modelo"] == "auto" and saude["regra"]["max_caracteres"] == 1500
+    assert s["tickets"] == 1 and s["simulados"] == 1
+
+
+def test_stats_com_banco_quebrado_responde_banco_indisponivel(tmp_path, monkeypatch):
+    import sqlite3
+
+    with _app_com_banco(tmp_path, []) as http:
+        def explode(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(sqlite3, "connect", explode)
+        r = http.get("/v1/stats")
+    assert r.status_code == 503
+    assert r.json()["erro"]["tipo"] == "banco_indisponivel"

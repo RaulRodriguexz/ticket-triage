@@ -5,12 +5,13 @@ Camada fina: traduz JSON para `Triador.triar()` e `FalhaTriagem` para status HTT
 
 import logging
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import __version__
 from .erros import ErroConfiguracao, FalhaTriagem
 from .modelos import TAMANHO_MAX_TEXTO, ResultadoTriagem, TipoErro
+from .persistencia import Registro
 from .servico import Triador
 from .simulado import ClienteSimulado
 
@@ -36,6 +38,7 @@ STATUS_POR_TIPO: dict[TipoErro, int] = {
     "conexao": 502,
     "timeout": 504,
     "configuracao": 503,
+    "banco_indisponivel": 503,
     "interno": 500,
 }
 
@@ -71,8 +74,9 @@ def _max_retries_do_ambiente() -> int:
 
 def _triador_do_ambiente() -> Triador:
     max_retries = _max_retries_do_ambiente()
-    cliente = ClienteSimulado.fixo() if os.environ.get("TRIAGEM_SIMULADO") == "1" else None
-    return Triador(cliente=cliente, max_retries=max_retries)
+    cliente = ClienteSimulado.por_modelo() if os.environ.get("TRIAGEM_SIMULADO") == "1" else None
+    # Sem banco (TRIAGEM_DB=off ou falha ao abrir), o servidor sobe sem persistência.
+    return Triador(cliente=cliente, max_retries=max_retries, registro=Registro.do_ambiente())
 
 
 RETRY_AFTER_PADRAO = "30"
@@ -120,7 +124,30 @@ def criar_app(triador: Triador | None = None) -> FastAPI:
 
     @app.get("/v1/saude")
     def saude(request: Request) -> dict:
-        return {"status": "ok", "modelo": request.app.state.triador.modelo}
+        triador: Triador = request.app.state.triador
+        return {
+            "status": "ok",
+            "modelo": triador.modelo,
+            "regra": triador.regra.descrever() if triador.regra else None,
+            "persistencia": triador.registro is not None,
+        }
+
+    @app.get("/v1/stats")
+    def stats(
+        request: Request,
+        desde: date | None = None,
+        ate: date | None = None,
+        simulado: int | None = Query(default=None, ge=0, le=1),
+    ) -> JSONResponse:
+        registro = request.app.state.triador.registro
+        if registro is None:
+            return _resposta_erro("configuracao", "Persistência desligada")
+        try:
+            dados = registro.estatisticas(desde, ate, None if simulado is None else bool(simulado))
+        except (sqlite3.Error, OSError) as erro:
+            log.warning("Banco indisponível em /v1/stats: %s", type(erro).__name__)
+            return _resposta_erro("banco_indisponivel", "Banco de dados indisponível")
+        return JSONResponse(dados)
 
     @app.post("/v1/triagem", response_model=ResultadoTriagem)
     def triagem(pedido: PedidoTriagem, request: Request) -> JSONResponse:

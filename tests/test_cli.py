@@ -93,3 +93,56 @@ def test_avaliar_destaca_metas_nao_medidas(capsys):
     rel = json.loads(capturado.out)
     assert rel["metas_nao_medidas"] == ["estabilidade"]
     assert "NÃO MEDIDA" in rel["aviso"] and "NÃO MEDIDA" in capturado.err
+
+
+def test_classificar_grava_e_avaliar_nao(tmp_path, monkeypatch, capsys):
+    import sqlite3
+
+    banco = tmp_path / "t.db"
+    monkeypatch.setenv("TRIAGEM_DB", str(banco))
+    main(["classificar", "--arquivo", str(EXEMPLOS), "--simulado"])
+    main(["avaliar", "--arquivo", str(EXEMPLOS), "--simulado"])
+    main(["avaliar", "--arquivo", str(EXEMPLOS), "--simulado", "--comparar"])
+    capsys.readouterr()
+    conexao = sqlite3.connect(banco)
+    try:
+        total = conexao.execute("SELECT COUNT(*) FROM triagens").fetchone()[0]
+    finally:
+        conexao.close()
+    assert total == len(json.loads(EXEMPLOS.read_text(encoding="utf-8")))
+
+
+def test_comparar_simulado(capsys, monkeypatch, exemplos):
+    monkeypatch.delenv("TRIAGEM_MODELO")
+    codigo = main(["avaliar", "--arquivo", str(EXEMPLOS), "--simulado", "--comparar"])
+    capturado = capsys.readouterr()
+    rel = json.loads(capturado.out)
+    linhas = {l["estrategia"]: l for l in rel["estrategias"]}
+    bloco = rel["comparacao"]
+
+    assert rel["simulado"] is True and "NÃO MEDE ACERTO NEM LATÊNCIA" in rel["aviso"]
+    assert "NÃO MEDE ACERTO" in capturado.err
+    assert list(linhas) == ["roteador", "sonnet", "haiku"]
+    assert linhas["sonnet"]["economia_pct"] == 0
+    assert linhas["haiku"]["custo_medio_usd"] < linhas["roteador"]["custo_medio_usd"] < linhas["sonnet"]["custo_medio_usd"]
+    assert all(l["total"] == len(exemplos) for l in linhas.values())
+    assert set(rel["relatorios"]) == {"roteador", "sonnet", "haiku"}
+    # O simulado escala demais para a meta de economia: o veredito tem que mostrar isso.
+    assert bloco["economia_pct"] == linhas["roteador"]["economia_pct"] < 40
+    assert bloco["metas"]["economia_vs_sonnet"]["status"] == "falhou"
+    assert bloco["metas"]["acerto_vs_sonnet"]["status"] == "ok"
+    assert bloco["aprovado"] is False and codigo == 1
+    assert bloco["taxa_escalonamento"] > bloco["escalonamento_maximo_para_meta"] > 0
+    assert bloco["nota"].startswith("SIMULADO")
+
+
+def test_comparar_nao_aceita_modelo(capsys):
+    assert main(["avaliar", "--arquivo", str(EXEMPLOS), "--simulado", "--comparar", "--modelo", MODELO_HAIKU]) == 2
+    assert _json(capsys)["erro"]["tipo"] == "entrada"
+
+
+def test_avaliar_simulado_marca_simulado(capsys):
+    main(["avaliar", "--arquivo", str(EXEMPLOS), "--simulado"])
+    rel = json.loads(capsys.readouterr().out)
+    assert rel["simulado"] is True and "NÃO MEDE ACERTO" in rel["aviso"]
+    assert set(rel["acerto_por_confianca"]) <= {"alta", "media", "baixa"}

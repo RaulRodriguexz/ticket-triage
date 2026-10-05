@@ -1,0 +1,11 @@
+# Só web/ pode ir para a Vercel. Publique com: cd web; vercel deploy --prod --yes
+# Se alguém rodar `vercel` da raiz por engano, tudo fora de web/ fica de fora
+# (.venv, data/, docs/, src/, CV e arquivos pessoais).
+/*
+!/web/
+
+# Mesmo dentro de web/, nunca segredos nem bancos.
+/web/**/.env*
+/web/**/*.db
+/web/**/*.db-*
+/web/.vercel/

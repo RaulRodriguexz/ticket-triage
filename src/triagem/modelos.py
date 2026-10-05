@@ -28,6 +28,12 @@ class Prioridade(str, Enum):
     baixa = "baixa"
 
 
+class Confianca(str, Enum):
+    alta = "alta"
+    media = "media"
+    baixa = "baixa"
+
+
 class Triagem(BaseModel):
     """O que o modelo gera. Vira o JSON Schema enviado à API."""
 
@@ -41,6 +47,8 @@ class Triagem(BaseModel):
     )
     resposta_sugerida: str
     justificativa: str
+    # Depois da justificativa: o modelo justifica antes de se autoavaliar.
+    confianca: Confianca
 
     @field_validator("resumo")
     @classmethod
@@ -87,15 +95,45 @@ class Chamado(BaseModel):
         return valor
 
 
+class ChamadaModelo(BaseModel):
+    """Uma chamada paga (ou possivelmente paga) dentro de uma triagem."""
+
+    modelo: str
+    tokens_entrada: int
+    tokens_saida: int
+    # Parte conhecida do custo; None se nada é conhecido (ex.: timeout sem usage).
+    custo_usd: float | None
+    latencia_ms: int
+    status: Literal["ok", "erro"] = "ok"
+    erro_tipo: str | None = None
+    # True quando parte do custo desta chamada é desconhecida (sem usage ou sem preço).
+    custo_desconhecido: bool = False
+
+
+class Roteamento(BaseModel):
+    modo: Literal["auto", "fixo"]
+    modelo_inicial: str
+    escalado: bool = False
+    # "texto_longo" (pré-roteado), "confianca_baixa", "prioridade", "falha_validacao",
+    # ou "<motivo> (falhou: <tipo>)" quando a escalada falhou na API.
+    motivo: str | None = None
+    chamadas: list[ChamadaModelo] = []
+
+
 class Meta(BaseModel):
+    # Modelo da resposta final; tokens, custo e latência são totais das chamadas.
     modelo: str
     latencia_ms: int
     tokens_entrada: int
     tokens_saida: int
-    # None quando o modelo que respondeu não está na tabela de preços.
+    # Soma dos custos conhecidos de todas as chamadas; None se nenhum é conhecido.
     custo_usd: float | None
+    # Chamadas cujo custo não é conhecido (sem usage, como em timeout, ou modelo sem preço).
+    # Com valor > 0, custo_usd é um piso, não o total.
+    custos_desconhecidos: int = 0
     # O "hoje" usado no prompt (AAAA-MM-DD), para auditoria.
     data_referencia: str | None = None
+    roteamento: Roteamento | None = None
 
 
 class ResultadoTriagem(Triagem):
@@ -112,6 +150,7 @@ class ResultadoTriagem(Triagem):
 
 TipoErro = Literal[
     "configuracao",
+    "banco_indisponivel",
     "entrada",
     "recusa",
     "validacao",
@@ -137,6 +176,8 @@ class ErroTriagem(BaseModel):
 
     id: str
     erro: DetalheErro
+    # O que já foi gasto até a falha; uso interno (custo, banco), fora do JSON.
+    gasto: "Meta | None" = Field(default=None, exclude=True)
 
 
 class ErroAvaliado(BaseModel):
@@ -172,4 +213,49 @@ class Relatorio(BaseModel):
     estabilidade: int | None = None
     # Destaque das metas que não puderam ser medidas (não reprovam).
     metas_nao_medidas: list[str] = []
+    aviso: str | None = None
+    simulado: bool = False
+    # Só no modo auto: escalados / chamados que começaram no modelo base.
+    taxa_escalonamento: float | None = None
+    escalonamentos_por_motivo: dict[str, int] = {}
+    # Acerto conjunto por confiança declarada na resposta final: {"alta": {"total", "acertos"}}.
+    acerto_por_confianca: dict[str, dict[str, int]] = {}
+
+
+class LinhaComparacao(BaseModel):
+    estrategia: str
+    modelo: str
+    total: int
+    acerto_conjunto: int
+    acerto_categoria: int
+    criticos_subestimados: int
+    aprovado: bool
+    custo_total_usd: float
+    custo_medio_usd: float | None
+    # Economia do custo médio em relação à estratégia "sonnet" (sempre Sonnet).
+    economia_pct: float | None
+    latencia_p95_ms: int | None
+    taxa_escalonamento: float | None
+    escalonamentos_por_motivo: dict[str, int]
+
+
+class BlocoComparacao(BaseModel):
+    """Veredito do roteador contra as metas comparativas do PRD §5."""
+
+    aprovado: bool
+    metas: dict[str, AvaliacaoMeta]
+    economia_pct: float | None
+    taxa_escalonamento: float | None
+    escalonamentos_por_motivo: dict[str, int]
+    # Maior taxa de escalonamento que ainda daria a economia mínima, com o custo médio
+    # medido de cada modelo: 1 - economia_minima - custo_haiku / custo_sonnet.
+    escalonamento_maximo_para_meta: float | None
+    nota: str
+
+
+class RelatorioComparacao(BaseModel):
+    simulado: bool
+    comparacao: BlocoComparacao
+    estrategias: list[LinhaComparacao]
+    relatorios: dict[str, Relatorio]
     aviso: str | None = None

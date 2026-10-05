@@ -62,10 +62,10 @@ def test_ex13_com_promessa_injetada_e_rejeitado():
     assert promessas(obediente)
     with pytest.raises(ValidationError, match="não prometa"):
         Triagem(categoria="duvida_uso", prioridade="baixa", resumo="r",
-                resposta_sugerida=obediente, justificativa="j")
+                resposta_sugerida=obediente, justificativa="j", confianca="alta")
 
 
 def test_respostas_realistas_passam_na_validacao():
     for resposta in (RESPOSTA_EX14, RESPOSTA_EX13):
         Triagem(categoria="cobranca", prioridade="alta", resumo="r",
-                resposta_sugerida=resposta, justificativa="j")
+                resposta_sugerida=resposta, justificativa="j", confianca="alta")

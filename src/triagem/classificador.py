@@ -97,27 +97,49 @@ def _aviso_validacao(erro: ValidationError) -> str:
 def classificar(
     chamado: Chamado, cliente: Any, config: Config
 ) -> ResultadoTriagem | ErroTriagem:
-    """Classifica um chamado. Nunca levanta exceção da API: devolve ErroTriagem."""
+    """Classifica um chamado. Nunca levanta exceção da API: devolve ErroTriagem.
+
+    Toda tentativa paga entra no gasto, inclusive as inválidas. No ErroTriagem, o gasto
+    vai em `gasto` (fora do JSON); uma chamada sem `usage` (timeout, erro de rede)
+    conta em `custos_desconhecidos` em vez de virar custo zero.
+    """
     id_chamado = chamado.id or "sem-id"
     tokens_entrada = tokens_saida = 0
+    modelo = config.modelo
     aviso: str | None = None
     inicio = time.perf_counter()
+
+    def gasto(desconhecidos: int = 0) -> Meta:
+        custo = custo_usd(modelo, tokens_entrada, tokens_saida)
+        pagou_algo = tokens_entrada or tokens_saida
+        return Meta(
+            modelo=modelo,
+            latencia_ms=round((time.perf_counter() - inicio) * 1000),
+            tokens_entrada=tokens_entrada,
+            tokens_saida=tokens_saida,
+            custo_usd=round(custo, 6) if custo is not None and pagou_algo else None,
+            custos_desconhecidos=desconhecidos + (custo is None and bool(pagou_algo)),
+        )
 
     for _ in range(2):
         system, user = prompt.montar(chamado, aviso)
         try:
             resposta = _chamar_api(cliente, config, system, user)
         except anthropic.APIError as erro:
-            return _erro_api(id_chamado, erro, tentativas=config.max_retries + 1)
+            falha = _erro_api(id_chamado, erro, tentativas=config.max_retries + 1)
+            falha.gasto = gasto(desconhecidos=1)  # esta chamada não devolveu usage
+            return falha
 
         # Soma antes de validar: tentativas inválidas também custam.
         tokens_entrada += resposta.usage.input_tokens
         tokens_saida += resposta.usage.output_tokens
+        modelo = resposta.model or config.modelo
 
         if resposta.stop_reason == "refusal":
             return ErroTriagem(
                 id=id_chamado,
                 erro=DetalheErro(tipo="recusa", mensagem="O modelo recusou classificar este chamado"),
+                gasto=gasto(),
             )
         try:
             triagem = _validar(resposta)
@@ -125,15 +147,9 @@ def classificar(
             aviso = invalida.aviso
             continue
 
-        modelo = resposta.model or config.modelo
-        custo = custo_usd(modelo, tokens_entrada, tokens_saida)
-        meta = Meta(
-            modelo=modelo,
-            latencia_ms=round((time.perf_counter() - inicio) * 1000),
-            tokens_entrada=tokens_entrada,
-            tokens_saida=tokens_saida,
-            custo_usd=None if custo is None else round(custo, 6),
-        )
+        meta = gasto()
+        if meta.custo_usd is None:
+            meta.custos_desconhecidos = 1
         return ResultadoTriagem(id=id_chamado, meta=meta, **triagem.model_dump())
 
     return ErroTriagem(
@@ -142,6 +158,7 @@ def classificar(
             tipo="validacao",
             mensagem=f"Resposta fora do schema após 2 tentativas. {aviso or ''}".strip(),
         ),
+        gasto=gasto(),
     )
 
 

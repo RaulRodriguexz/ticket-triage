@@ -5,16 +5,19 @@ from dataclasses import dataclass, field
 
 from .erros import ErroConfiguracao  # reexportado: mantém `config.ErroConfiguracao`
 
-MODELO_PADRAO = "claude-sonnet-5-5"
+MODELO_SONNET = "claude-sonnet-5-5"
 MODELO_HAIKU = "claude-haiku-4-5-20251001"
+# "auto" = roteador (Haiku primeiro, Sonnet nos casos difíceis). Decisão do Theo: padrão já.
+MODO_AUTO = "auto"
+MODELO_PADRAO = MODO_AUTO
 
-# Modelos aceitos em --modelo / TRIAGEM_MODELO.
-MODELOS_SUPORTADOS = (MODELO_PADRAO, MODELO_HAIKU)
+# Valores aceitos em --modelo / TRIAGEM_MODELO.
+MODELOS_SUPORTADOS = (MODO_AUTO, MODELO_SONNET, MODELO_HAIKU)
 
 # US$ por 1M de tokens: (entrada, saída). Inclui os modelos para onde o
 # fallback de recusa pode desviar, para o custo usar o preço de quem respondeu.
 PRECOS: dict[str, tuple[float, float]] = {
-    MODELO_PADRAO: (2.00, 10.00),
+    MODELO_SONNET: (2.00, 10.00),
     MODELO_HAIKU: (1.00, 5.00),
     "claude-haiku-4-5": (1.00, 5.00),
     "claude-sonnet-5": (2.00, 10.00),
@@ -42,6 +45,10 @@ class Config:
             f"Config(modelo={self.modelo!r}, api_key={chave!r}, "
             f"timeout_s={self.timeout_s}, max_retries={self.max_retries})"
         )
+
+    @property
+    def eh_auto(self) -> bool:
+        return self.modelo == MODO_AUTO
 
     @property
     def eh_haiku(self) -> bool:

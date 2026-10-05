@@ -9,6 +9,7 @@ VALIDO = {
     "resumo": "Sistema indisponível (erro 503) para todos os 12 usuários desde as 8h; loja parada.",
     "resposta_sugerida": "Olá! Recebemos seu chamado e entendemos que o sistema está indisponível.",
     "justificativa": "Todos os usuários sem acesso e operação de vendas parada, sem contorno.",
+    "confianca": "alta",
 }
 
 
