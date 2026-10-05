@@ -172,8 +172,8 @@ def _comparar(roteador, sonnet=None, haiku=None):
 
 
 def test_comparacao_aprovada_com_economia_e_acerto():
-    bloco = _comparar(_relatorio(0.006, taxa=0.3))  # 40% mais barato, mesmo acerto
-    assert bloco.economia_pct == 40.0
+    bloco = _comparar(_relatorio(0.007, taxa=0.3))  # 30% mais barato (no limite), mesmo acerto
+    assert bloco.economia_pct == 30.0
     assert {n: m.status for n, m in bloco.metas.items()} == {
         "metas_individuais": "ok", "acerto_conjunto": "ok", "criticos_subestimados": "ok",
         "economia_vs_sonnet": "ok", "acerto_vs_sonnet": "ok",
@@ -181,10 +181,12 @@ def test_comparacao_aprovada_com_economia_e_acerto():
     assert bloco.aprovado
 
 
-def test_economia_abaixo_de_40_reprova():
-    bloco = _comparar(_relatorio(0.0079))  # 21% de economia
-    assert bloco.metas["economia_vs_sonnet"].status == "falhou"
-    assert not bloco.aprovado
+@pytest.mark.parametrize("custo,status", [(0.0079, "falhou"), (0.0071, "falhou"), (0.0070, "ok"), (0.0060, "ok")])
+def test_meta_de_economia_e_30_por_cento(custo, status):
+    bloco = _comparar(_relatorio(custo))  # sempre-Sonnet custa 0,010
+    assert bloco.metas["economia_vs_sonnet"].status == status
+    assert bloco.metas["economia_vs_sonnet"].alvo.startswith(">= 30%")
+    assert bloco.aprovado is (status == "ok")
 
 
 def test_acerto_abaixo_do_sonnet_reprova_mesmo_barato():
@@ -203,11 +205,11 @@ def test_critico_subestimado_no_roteador_reprova():
 def test_escalonamento_maximo_para_meta():
     from triagem.avaliacao import escalonamento_maximo
 
-    # Haiku custa 30% do Sonnet: 0,3 + t <= 0,6  →  t <= 30%.
-    assert escalonamento_maximo(0.003, 0.010) == pytest.approx(0.3)
-    assert escalonamento_maximo(0.007, 0.010) == 0.0   # nem sem escalar daria 40%
+    # Haiku custa 30% do Sonnet: 0,3 + t <= 0,7  →  t <= 40%.
+    assert escalonamento_maximo(0.003, 0.010) == pytest.approx(0.4)
+    assert escalonamento_maximo(0.008, 0.010) == 0.0   # nem sem escalar daria 30%
     assert escalonamento_maximo(None, 0.010) is None
-    assert _comparar(_relatorio(0.006, taxa=0.5)).escalonamento_maximo_para_meta == pytest.approx(0.3)
+    assert _comparar(_relatorio(0.006, taxa=0.5)).escalonamento_maximo_para_meta == pytest.approx(0.4)
 
 
 def test_gasto_de_triagem_com_erro_entra_no_custo():

@@ -27,9 +27,9 @@ triagem avaliar --arquivo docs/exemplos.json --comparar              # roteador 
 ```
 
 - **Modelo:** `--modelo`, senão `TRIAGEM_MODELO`, senão `auto`. `auto` é o roteador; `claude-sonnet-5-5` ou `claude-haiku-4-5-20251001` fixam um modelo.
-- **Roteador (`auto`):** um texto com mais de `TRIAGEM_ROTEADOR_MAX_CARACTERES` caracteres vai direto ao Sonnet. Os demais vão ao Haiku, que escala para o Sonnet quando declara confiança abaixo de `TRIAGEM_ROTEADOR_CONFIANCA_MINIMA`, quando dá uma prioridade listada em `TRIAGEM_ROTEADOR_PRIORIDADES` ou quando a resposta falha na validação duas vezes. O custo em `meta.custo_usd` soma as duas chamadas, cada uma pelo preço do seu modelo, e `meta.roteamento` traz o motivo e as chamadas. Na biblioteca, a regra também pode ser passada em `Triador(regra=RegraRoteamento(...))`.
-- **`--comparar`:** roda as três estratégias sobre o mesmo arquivo e mostra, para cada uma, acerto, críticos subestimados, custo médio, economia em relação ao sempre-Sonnet e taxa de escalonamento. O bloco `comparacao` dá o veredito: além das metas do roteador, exige economia de pelo menos 40% sobre o sempre-Sonnet e acerto conjunto pelo menos igual ao dele. O bloco traz também `escalonamento_maximo_para_meta`, a maior taxa de escalonamento que ainda daria essa economia. O exit code segue esse veredito; a opção não aceita `--modelo`. Com `--simulado`, o relatório traz `"simulado": true` e um aviso: o simulado devolve o gabarito, com tokens e confiança fictícios, e por isso não mede acerto nem latência.
-- **Histórico:** `classificar` e `POST /v1/triagem` gravam cada triagem em SQLite (`data/triage.db`); `avaliar` nunca grava. Toda chamada paga entra no custo, inclusive tentativas inválidas e escaladas que falharam. Uma chamada sem `usage` (timeout, por exemplo) conta em `custos_desconhecidos`, e nesse caso `custo_usd` é um piso. Por padrão, o banco guarda só o hash do texto, nunca o texto, o resumo, a resposta nem a chave.
+- **Roteador (`auto`):** um texto com mais de `TRIAGEM_ROTEADOR_MAX_CARACTERES` caracteres vai direto ao Sonnet. Os demais vão ao Haiku, que escala para o Sonnet quando declara confiança abaixo de `TRIAGEM_ROTEADOR_CONFIANCA_MINIMA`, quando dá uma prioridade listada em `TRIAGEM_ROTEADOR_PRIORIDADES` ou quando a resposta falha na validação duas vezes. Regra de segurança: `critica` sempre escala, mesmo que a variável não a liste. O custo em `meta.custo_usd` soma as duas chamadas, cada uma pelo preço do seu modelo, e `meta.roteamento` traz o motivo e as chamadas. Na biblioteca, a regra também pode ser passada em `Triador(regra=RegraRoteamento(...))`.
+- **`--comparar`:** roda as três estratégias sobre o mesmo arquivo e mostra, para cada uma, acerto, críticos subestimados, custo médio, economia em relação ao sempre-Sonnet e taxa de escalonamento. O bloco `comparacao` dá o veredito: além das metas do roteador, exige economia de pelo menos 30% sobre o sempre-Sonnet (custo do roteador ≤ 70% do dele) e acerto conjunto pelo menos igual ao dele. O bloco traz também `escalonamento_maximo_para_meta`, a maior taxa de escalonamento que ainda daria essa economia: 0,7 − custo médio do Haiku ÷ custo médio do Sonnet. O exit code segue esse veredito; a opção não aceita `--modelo`. Com `--simulado`, o relatório traz `"simulado": true` e um aviso: o simulado devolve o gabarito, com tokens e confiança fictícios, e por isso não mede acerto nem latência.
+- **Histórico:** `classificar` e `POST /v1/triagem` gravam cada triagem em SQLite (`data/triage.db`); `avaliar` nunca grava. O motivo do roteamento fica na coluna `motivo_roteamento` (`texto_longo`, `confianca_baixa`, `prioridade`, `falha_validacao` ou `<motivo> (falhou: <tipo>)`), que corresponde a `meta.roteamento.motivo` na resposta e a `roteamento.por_motivo` no `/v1/stats`. Toda chamada paga entra no custo, inclusive tentativas inválidas e escaladas que falharam. Uma chamada sem `usage` (timeout, por exemplo) conta em `custos_desconhecidos`, e nesse caso `custo_usd` é um piso. Por padrão, o banco guarda só o hash do texto, nunca o texto, o resumo, a resposta nem a chave.
 - **Confiança:** cada resposta tem o campo `confianca` (`alta`, `media` ou `baixa`), novo na versão 0.3.0. É uma mudança compatível, porque só acrescenta um campo.
 - **Códigos de saída:** `0` = tudo classificado ou avaliação aprovada; `1` = algum chamado com erro ou avaliação reprovada; `2` = erro de configuração ou de entrada.
 - **Data de referência:** cada chamado aceita `data_referencia` (AAAA-MM-DD), que o prompt usa como "hoje". Para os chamados sem ela, `--data-referencia` define a data. Se nenhuma for informada, `classificar` usa a data atual e `avaliar` envia "não informada", sem ler o relógio.
@@ -69,7 +69,7 @@ uvicorn triagem.web:app --host 127.0.0.1 --port 8000
 | `TRIAGEM_MODELO` | `auto` | `auto` (roteador), `claude-sonnet-5-5` ou `claude-haiku-4-5-20251001` |
 | `TRIAGEM_ROTEADOR_MAX_CARACTERES` | `1500` | Texto maior vai direto ao Sonnet |
 | `TRIAGEM_ROTEADOR_CONFIANCA_MINIMA` | `media` | Confiança do Haiku abaixo disto escala (`alta` escala também `media`) |
-| `TRIAGEM_ROTEADOR_PRIORIDADES` | `critica` | Prioridades do Haiku que escalam, separadas por vírgula (ex.: `critica,alta`) |
+| `TRIAGEM_ROTEADOR_PRIORIDADES` | `critica` | Prioridades do Haiku que escalam, separadas por vírgula (ex.: `critica,alta`); `critica` entra sempre |
 | `TRIAGEM_DB` | `data/triage.db` | Caminho do SQLite; `off` desliga o histórico |
 | `TRIAGEM_DB_GUARDAR_TEXTO` | (vazio) | `1` grava também o texto do chamado |
 | `TRIAGEM_HASH_SEGREDO` | (vazio) | Segredo do HMAC do hash do texto; sem ele, o hash é SHA-256 simples |
@@ -113,15 +113,15 @@ Os testes usam o cliente falso (`src/triagem/simulado.py`) e não chamam a API. 
 
 | Execução | Acerto conjunto | Críticos subestimados | Estabilidade (3×) | Custo médio | Economia vs Sonnet | Exit |
 |---|---|---|---|---|---|---|
-| `pytest` | 224 passaram, 1 pulado (`test_api_real`, sem chave) | | | | | 0 |
+| `pytest` | 227 passaram, 1 pulado (`test_api_real`, sem chave) | | | | | 0 |
 | `avaliar --simulado` (auto) | 14/14 | 0 | não medida | US$ 0,0060 (fictício) | | 0 |
 | `avaliar --simulado --repeticoes 3` | 14/14 | 0 | 14/14 | US$ 0,0060 (fictício) | | 0 |
-| `avaliar --simulado --comparar` (roteador) | 14/14 | 0 | | US$ 0,0060 | 21,3%: **falhou** (meta ≥ 40%) | 1 |
+| `avaliar --simulado --comparar` (roteador) | 14/14 | 0 | | US$ 0,0060 | 21,3%: **falhou** (meta ≥ 30%) | 1 |
 | `avaliar` sem chave | — | — | — | — | — | 2 (`configuracao`) |
 | Roteador, real | pendente | | | | | |
 | Sonnet 5.5, real | pendente | | | | | |
 | Haiku 4.5, real | pendente | | | | | |
 
-No `--comparar` simulado, o roteador escala 42,9% dos chamados (6 de 14, todos por confiança baixa). Com os custos médios simulados, a meta de 40% de economia exigiria escalar no máximo 24,1% (`escalonamento_maximo_para_meta`).
+No `--comparar` simulado, o roteador escala 42,9% dos chamados (6 de 14, todos por confiança baixa). Com os custos médios simulados, a meta de 30% de economia exigiria escalar no máximo 34,1% (`escalonamento_maximo_para_meta`).
 
 O modo simulado devolve o próprio gabarito, com confiança e tokens fictícios. Os 14/14 e a economia acima só provam que o fluxo, o relatório, a conta de custo e os códigos de saída funcionam. Não dizem nada sobre o acerto nem sobre o custo real do modelo.

@@ -248,7 +248,8 @@ class BlocoComparacao(BaseModel):
     taxa_escalonamento: float | None
     escalonamentos_por_motivo: dict[str, int]
     # Maior taxa de escalonamento que ainda daria a economia mínima, com o custo médio
-    # medido de cada modelo: 1 - economia_minima - custo_haiku / custo_sonnet.
+    # medido de cada modelo: 1 - economia_minima - custo_haiku / custo_sonnet
+    # (com a meta de 30%: 0,7 - custo_haiku / custo_sonnet).
     escalonamento_maximo_para_meta: float | None
     nota: str
 

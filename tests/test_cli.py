@@ -128,7 +128,7 @@ def test_comparar_simulado(capsys, monkeypatch, exemplos):
     assert all(l["total"] == len(exemplos) for l in linhas.values())
     assert set(rel["relatorios"]) == {"roteador", "sonnet", "haiku"}
     # O simulado escala demais para a meta de economia: o veredito tem que mostrar isso.
-    assert bloco["economia_pct"] == linhas["roteador"]["economia_pct"] < 40
+    assert bloco["economia_pct"] == linhas["roteador"]["economia_pct"] < 30
     assert bloco["metas"]["economia_vs_sonnet"]["status"] == "falhou"
     assert bloco["metas"]["acerto_vs_sonnet"]["status"] == "ok"
     assert bloco["aprovado"] is False and codigo == 1

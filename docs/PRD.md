@@ -75,7 +75,7 @@ A IA **sugere**, o humano **decide e envia**. Nada é enviado automaticamente.
 | Latência por chamado | p95 ≤ 10 s | Tempo medido pela CLI |
 | Custo por chamado | ≤ US$ 0,01 (média) | Tokens de entrada e saída × preço do modelo, reportados pela CLI |
 | Resumo | ≤ 120 caracteres em 100% dos casos | Validação do schema |
-| **Router: economia de custo** | Custo médio por chamado com roteador **≤ 60% do sempre-Sonnet (≥ 40% de economia)**, contando as duas chamadas dos casos escalonados. **Inatingível no conjunto atual (ver seção 13); pendente de decisão** | `triagem avaliar --comparar` |
+| **Router: economia de custo** | Custo médio por chamado com roteador **≤ 70% do sempre-Sonnet (≥ 30% de economia)**, contando as duas chamadas dos casos escalonados (decisão do usuário, 05/10; ver a margem na seção 13) | `triagem avaliar --comparar` |
 | **Router: acerto preservado** | Acerto conjunto com router **≥ acerto do sempre-Sonnet** na mesma execução e ≥ 12/14; **0** críticos subestimados (se falhar, o padrão volta para o Sonnet) | `triagem avaliar --comparar` |
 | Router: taxa de escalonamento | Reportada, com `escalonamento_maximo_para_meta` (sem meta própria; com os preços atuais, economia ≈ 50% − taxa de escalonamento) | `triagem avaliar --comparar` e `GET /v1/stats` |
 | Persistência sem segredo | 0 ocorrências da chave da API no arquivo `.db` | Teste automatizado (RNF-09) |
@@ -94,7 +94,7 @@ A IA **sugere**, o humano **decide e envia**. Nada é enviado automaticamente.
 | Dados pessoais enviados à API (nome, e-mail, dados de cartão) | A POC usa só dados fictícios. Em produção, o texto vai à API da Anthropic para classificar (ver Limitações, seção 16); localmente, o texto bruto **não** é gravado por padrão (seção 14) |
 | Router: o Haiku subestima um chamado crítico (diz `alta`) e ele não é escalonado | A meta "0 críticos subestimados" vale para o modo router. **Se falhar no `avaliar --comparar`, o padrão volta para o Sonnet** (decisão do Theo); incluir `alta` em `TRIAGEM_ROTEADOR_PRIORIDADES` é a alternativa para tentar de novo |
 | Router: confiança autodeclarada pelo modelo é mal calibrada | O nível mínimo é configurável (`TRIAGEM_ROTEADOR_CONFIANCA_MINIMA`); o relatório traz `acerto_por_confianca` para checar a calibração |
-| Banco local cresce com dados sensíveis (resumo pode citar nomes) | Resumo e resposta também ficam fora do banco por padrão; retenção configurável (RF-14) |
+| Banco local cresce com dados sensíveis (resumo pode citar nomes) | Resumo e resposta nunca vão para o banco; texto só com `TRIAGEM_DB_GUARDAR_TEXTO=1`; retenção configurável (RF-14) |
 | Variação do modelo entre versões | Fixar o ID do modelo na configuração. Rodar a avaliação ao trocar |
 
 ### Suposições
@@ -159,7 +159,8 @@ A prioridade mede **impacto e prazo concretos**, não o tom do texto. Palavras c
   "resposta_sugerida": "Olá! Recebemos seu chamado e entendemos que o sistema está indisponível para toda a equipe. ...",
   "justificativa": "Todos os usuários sem acesso e operação de vendas parada, sem contorno.",
   "confianca": "alta",
-  "meta": { "modelo": "claude-sonnet-5-5", "escalonado": true, "motivo_escalonamento": "prioridade", "latencia_ms": 4100, "tokens_entrada": 2700, "tokens_saida": 420, "custo_estimado_usd": 0.012 }
+  "meta": { "modelo": "claude-sonnet-5-5", "latencia_ms": 4100, "tokens_entrada": 2700, "tokens_saida": 420, "custo_usd": 0.012, "custos_desconhecidos": 0, "data_referencia": "2026-10-01",
+            "roteamento": { "modo": "auto", "modelo_inicial": "claude-haiku-4-5-20251001", "escalado": true, "motivo": "prioridade", "chamadas": ["..."] } }
 }
 ```
 - `categoria` e `prioridade`: apenas os códigos das seções 7 e 8.
@@ -277,34 +278,47 @@ Valor inválido em qualquer uma dessas variáveis gera erro de configuração (n
 
 **Padrão e validação (decisão do Theo):** `auto` já é o padrão nesta fase. A validação é `triagem avaliar --comparar` com a API real; **se houver qualquer crítico subestimado no modo roteador, o padrão volta para `claude-sonnet-5-5`** até nova avaliação.
 
-**Meta (seção 5), igual à do `--comparar` no código:** nos 14 exemplos, o roteador tem economia de custo **≥ 40%** sobre o sempre-Sonnet, acerto conjunto **≥ o do sempre-Sonnet** e **0** críticos subestimados. O relatório traz `escalonamento_maximo_para_meta`, a maior taxa de escalonamento que ainda dá 40%.
+**Meta (seção 5):** nos 14 exemplos, o roteador tem economia de custo **≥ 30%** sobre o sempre-Sonnet (custo médio ≤ 70%), acerto conjunto **≥ o do sempre-Sonnet** e **0** críticos subestimados. O relatório traz `escalonamento_maximo_para_meta`, a maior taxa de escalonamento que ainda dá 30%. **Regra de segurança mantida:** prioridade `critica` vinda do Haiku **sempre** escala para o Sonnet (`critica` não pode sair de `TRIAGEM_ROTEADOR_PRIORIDADES`), mesmo que isso custe a meta de economia.
 
-> **Atenção: a meta de 40% é inatingível no conjunto atual com os preços do código.** Em `config.py`, o Haiku custa metade do Sonnet (US$ 1/5 contra 2/10 por milhão de tokens). Com tokens parecidos, um chamado não escalonado custa 0,5 do Sonnet e um escalonado custa 1,5 (as duas chamadas). Então **economia ≈ 50% − taxa de escalonamento**, e 40% exige escalonar no máximo cerca de 10%. Os 14 exemplos têm 2 críticos (EX-01, EX-07), que **escalam por regra** se o Haiku acertar: isso já dá 2/14 ≈ 14% e economia máxima ≈ 36%. Ou seja, o roteador só passaria nos 40% errando um crítico, o que reprova pela outra meta. **Pendente de decisão do Theo:** baixar a meta para ≥ 30% (folga para 1 escalonamento por confiança baixa) ou medi-la em um conjunto com proporção realista de críticos. Até lá, a meta continua 40% para ficar igual ao código.
+> **Margem da meta de 30% (pendência de 05/10 resolvida por decisão do usuário: meta baixada de 40% para 30%).** Em `config.py`, o Haiku custa metade do Sonnet (US$ 1/5 contra 2/10 por milhão de tokens). Com tokens parecidos, um chamado não escalado custa 0,5 do Sonnet e um escalado custa 1,5 (as duas chamadas). Então **economia ≈ 50% − taxa de escalonamento**, e 30% admite escalar até cerca de 20%. Nos 14 exemplos, os 2 críticos (EX-01, EX-07) escalam por regra: 2/14 ≈ 14%, economia ≈ 36%, **passa**. Mas a margem é de só esses 2: **um terceiro escalonamento** (confiança baixa ou falha de validação) leva a 3/14 ≈ 21% e economia ≈ 29%, **reprova**. Corrijo aqui o que registrei antes ("folga para 1 escalonamento por confiança baixa"): essa folga não existe com 14 exemplos. Se a medição real reprovar por 1 ponto, a saída é medir num conjunto maior com proporção realista de críticos, não tirar `critica` do escalonamento.
+>
+> **Divergência com o código:** `src/triagem/avaliacao.py` ainda tem `META_ECONOMIA_PCT = 40.0`. O `--comparar` só reflete a meta deste PRD depois que essa constante for trocada para `30.0` (tarefa do Rafa).
 
 ## 14. Persistência (fase 2)
 
 **SQLite local**, arquivo `data/triage.db` (caminho em `TRIAGEM_DB`; `TRIAGEM_DB=off` desliga a persistência). Uma linha por triagem, na tabela `triagens`:
 
-| Campo | Tipo | Observação |
-|---|---|---|
-| `id` | inteiro, PK | Autoincremento |
-| `criado_em` | texto ISO 8601, UTC | Timestamp da triagem |
-| `origem` | `cli` \| `api` | `classificar` ou `POST /v1/triagem` |
-| `chamado_id` | texto, nulo | O `id` da entrada, se houver |
-| `data_referencia` | texto `AAAA-MM-DD` | |
-| `categoria`, `prioridade` | texto, nulo | Nulos quando houve erro |
-| `confianca` | texto, nulo | `alta` \| `media` \| `baixa` |
-| `modelo` | texto | Modelo da resposta final |
-| `escalonado` | 0/1 | |
-| `motivo_escalonamento` | texto, nulo | `texto_longo` \| `confianca_baixa` \| `prioridade` \| `falha_validacao` |
-| `latencia_ms` | inteiro | Total, incluindo o escalonamento |
-| `tokens_entrada`, `tokens_saida` | inteiro | Somados das chamadas |
-| `custo_estimado_usd` | real | Pela tabela de preços do RNF-12 |
-| `erro` | texto, nulo | Código curto (`rate_limit`, `timeout`, `saida_invalida`, `api_erro`); nunca stack trace |
-| `texto_hash` | texto | HMAC-SHA-256 do assunto + texto com `TRIAGEM_HASH_SEGREDO`; sem o segredo, SHA-256 simples (com aviso no log). Detecta duplicados sem guardar o conteúdo |
-| `texto`, `resumo`, `resposta_sugerida` | texto, nulo | **Só preenchidos com `TRIAGEM_DB_GUARDAR_TEXTO=1`** |
+Nomes e tipos exatamente como em `src/triagem/persistencia.py` (schema versão 2), que é a fonte da verdade:
 
-**Decisão de privacidade (LGPD):** por padrão **não** se grava o texto bruto, nem o resumo ou a resposta, porque os dois podem repetir nomes, e-mails e dados do cliente. Grava-se só o hash. Isso aplica a minimização de dados: as estatísticas da seção 15 não precisam do conteúdo. Quem ativar `TRIAGEM_DB_GUARDAR_TEXTO=1` (ex.: para auditar erros) assume a base legal e a retenção (RF-14). O hash é **pseudonimização**, não anonimização: um texto curto e previsível pode ser adivinhado por força bruta.
+| Coluna | Tipo | Observação |
+|---|---|---|
+| `id` | INTEGER, PK | Autoincremento |
+| `criado_em` | TEXT, não nulo | ISO 8601 em UTC |
+| `chamado_id` | TEXT | O `id` da entrada, se houver |
+| `canal` | TEXT | `email` \| `ticket`, se informado |
+| `texto_hash` | TEXT, não nulo | HMAC-SHA-256 de assunto + texto com `TRIAGEM_HASH_SEGREDO`; sem o segredo, SHA-256 simples (com aviso no log) |
+| `texto_tamanho` | INTEGER, não nulo | Caracteres do campo `texto` |
+| `texto` | TEXT | **Só preenchido com `TRIAGEM_DB_GUARDAR_TEXTO=1`** |
+| `data_referencia` | TEXT | `AAAA-MM-DD` |
+| `status` | TEXT, não nulo | `ok` \| `erro` |
+| `erro_tipo` | TEXT | Quando `status = erro`: `configuracao`, `banco_indisponivel`, `entrada`, `recusa`, `validacao`, `autenticacao`, `limite_taxa`, `timeout`, `conexao`, `requisicao_invalida`, `api`, `interno`. Nunca stack trace |
+| `categoria`, `prioridade` | TEXT | Nulos quando houve erro |
+| `confianca` | TEXT | `alta` \| `media` \| `baixa` |
+| `modo` | TEXT, não nulo | `auto` (roteador) \| `fixo` |
+| `modelo_inicial` | TEXT | Primeiro modelo chamado |
+| `modelo_final` | TEXT | Modelo da resposta final (nulo em erro) |
+| `escalado` | INTEGER 0/1, não nulo | 1 quando houve segunda chamada ao Sonnet |
+| `motivo_roteamento` | TEXT | `texto_longo` (pré-roteado) \| `confianca_baixa` \| `prioridade` \| `falha_validacao`, ou `"<motivo> (falhou: <tipo>)"` quando a escalada falhou na API |
+| `tokens_entrada`, `tokens_saida` | INTEGER | Somados das chamadas |
+| `custo_usd` | REAL | Estimado pela tabela `PRECOS` (RNF-12), somando as chamadas |
+| `custos_desconhecidos` | INTEGER, não nulo | Nº de chamadas pagas sem preço conhecido na tabela |
+| `latencia_ms` | INTEGER | Total, incluindo a escalada |
+| `simulado` | INTEGER 0/1, não nulo | 1 quando a triagem veio do cliente simulado |
+| `versao` | TEXT, não nulo | Versão do pacote que gravou |
+
+**Não há coluna de origem**: o banco não distingue `classificar` de `POST /v1/triagem`.
+
+**Decisão de privacidade (LGPD):** por padrão **não** se grava o texto bruto, só o hash e o tamanho. Resumo e resposta sugerida **nunca** são gravados (não há coluna para eles), porque podem repetir nomes, e-mails e dados do cliente. Isso aplica a minimização de dados: as estatísticas da seção 15 não precisam do conteúdo. Quem ativar `TRIAGEM_DB_GUARDAR_TEXTO=1` (ex.: para auditar erros) assume a base legal e a retenção (RF-14). O hash é **pseudonimização**, não anonimização: um texto curto e previsível pode ser adivinhado por força bruta.
 
 **Nunca gravados:** a chave da API (RNF-09), cabeçalhos HTTP, prompt completo.
 
@@ -314,34 +328,45 @@ Servidor HTTP local mínimo (`triagem servir`, porta padrão 8000, host `127.0.0
 
 ### `POST /v1/triagem`
 - Corpo: **um** chamado no formato de entrada da seção 9. Resposta `200`: a saída da seção 9, com a mesma lógica de `classificar` (router, `data_referencia`, RF-08).
-- Grava no SQLite com `origem = api` (RF-12), inclusive quando dá erro.
+- Grava no SQLite (RF-12), inclusive quando dá erro, na mesma tabela e com as mesmas colunas de `classificar`.
 - Entrada inválida (sem `texto`, JSON malformado) → `400` com `{"erro": "..."}`, sem chamar o modelo. Falha da API da Anthropic após as tentativas do RNF-05 → `502` com `{"erro": "<código>"}`.
 
 ### `GET /v1/stats`
 Endpoint **só de leitura**, calculado a partir do SQLite.
 
-Parâmetros opcionais: `desde` e `ate` (`AAAA-MM-DD`, filtram por `criado_em`).
+Parâmetros opcionais: `desde` e `ate` (`AAAA-MM-DD`, filtram pela data de `criado_em`) e `simulado` (filtra pela coluna `simulado`).
+
+Chaves exatamente como em `Registro.estatisticas()` (`src/triagem/persistencia.py`):
 
 ```json
 {
-  "periodo": { "desde": "2026-10-01", "ate": "2026-10-05", "primeira": "2026-10-01T12:03:11Z", "ultima": "2026-10-05T09:40:02Z" },
-  "total": 120,
-  "sucesso": 117,
+  "periodo": { "desde": "2026-10-01", "ate": "2026-10-05" },
+  "tickets": 120,
+  "ok": 117,
   "erros": 3,
-  "escalonados": 21,
-  "taxa_escalonamento": 0.18,
+  "erros_por_tipo": { "limite_taxa": 2, "timeout": 1 },
+  "simulados": 0,
   "custo_total_usd": 0.41,
-  "custo_medio_usd": 0.0035,
-  "latencia_p95_ms": 3900,
+  "custo_medio_usd": 0.003417,
+  "custos_desconhecidos": 0,
   "por_categoria": { "acesso": 18, "cobranca": 22, "bug_tecnico": 30, "duvida_uso": 31, "sugestao": 9, "outro": 7 },
   "por_prioridade": { "critica": 4, "alta": 19, "media": 35, "baixa": 59 },
   "por_modelo": { "claude-haiku-4-5-20251001": 96, "claude-sonnet-5-5": 21 },
-  "por_motivo_escalonamento": { "prioridade": 5, "confianca_baixa": 12, "texto_longo": 3, "falha_validacao": 1 },
-  "por_erro": { "rate_limit": 2, "timeout": 1 }
+  "roteamento": {
+    "pre_roteados": 3,
+    "iniciados_no_haiku": 117,
+    "escalados": 18,
+    "taxa_escalonamento": 0.1538,
+    "por_motivo": { "prioridade": 5, "confianca_baixa": 12, "falha_validacao": 1 }
+  },
+  "latencia_ms": { "p50": 2100, "p95": 3900 },
+  "banco": { "ativo": true }
 }
 ```
-- Contagens por categoria e prioridade consideram só triagens com sucesso; `por_modelo` conta pelo modelo final. Todas as chaves das listas fechadas aparecem, mesmo com 0.
-- Banco vazio → `200` com totais 0. Parâmetro de data inválido → `400` com `{"erro": "..."}`.
+- `por_categoria`, `por_prioridade` e `por_modelo` contam só triagens com `status = ok`; `por_modelo` usa `modelo_final`. Em `por_categoria` e `por_prioridade` todas as chaves das listas fechadas aparecem, mesmo com 0.
+- `roteamento` considera só `modo = auto`. `pre_roteados` são os de `texto_longo`, que vão direto ao Sonnet e **não** contam como escalados nem aparecem em `por_motivo` (que só conta `escalado = 1`). `taxa_escalonamento = escalados / iniciados_no_haiku`.
+- `custo_total_usd` inclui o gasto das triagens com erro. `custos_desconhecidos` conta as linhas com alguma chamada sem custo conhecido; com valor > 0, o total é um piso.
+- Banco vazio → `200` com contagens 0 e `custo_medio_usd`, `taxa_escalonamento` nulos. Parâmetro de data inválido → `400` com `{"erro": "..."}`.
 - **Nunca** devolve texto, resumo, resposta nem hash.
 
 ## 16. Limitações atuais

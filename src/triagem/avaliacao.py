@@ -28,9 +28,9 @@ META_ACERTO_CATEGORIA = 0.9
 META_ESTABILIDADE = 0.9
 META_P95_MS = 10_000
 META_CUSTO_MEDIO_USD = 0.01
-# Metas comparativas (PRD §5): roteador custa no máximo 60% do sempre-Sonnet
+# Metas comparativas (PRD §5): roteador custa no máximo 70% do sempre-Sonnet
 # e acerta pelo menos o mesmo que ele na mesma execução.
-META_ECONOMIA_PCT = 40.0
+META_ECONOMIA_PCT = 30.0
 
 AVISO_SIMULADO = (
     "Modo simulado: as respostas vêm do gabarito e a confiança e os tokens são fictícios "

@@ -561,7 +561,7 @@ def deve_escalar(resultado: ResultadoTriagem | ErroTriagem, regra: RegraRoteamen
 |---|---|
 | `TRIAGEM_ROTEADOR_MAX_CARACTERES` | `1500` |
 | `TRIAGEM_ROTEADOR_CONFIANCA_MINIMA` | `media` |
-| `TRIAGEM_ROTEADOR_PRIORIDADES` | `critica` (lista separada por vírgula, ex.: `critica,alta`) |
+| `TRIAGEM_ROTEADOR_PRIORIDADES` | `critica` (lista separada por vírgula, ex.: `critica,alta`). `critica` é obrigatória: crítico sempre escala (ver "Meta de economia"). |
 
 Todos os valores aceitam maiúsculas e minúsculas. `MAX_CARACTERES` precisa ser um inteiro ≥ 1; `CONFIANCA_MINIMA` aceita `alta`, `media` ou `baixa`; `PRIORIDADES` aceita `critica`, `alta`, `media` e `baixa`.
 
@@ -569,7 +569,7 @@ Um arquivo de configuração fica fora: com 3 valores, variáveis de ambiente ba
 
 **Os valores iniciais são chutes a calibrar:**
 - **1.500 caracteres, contando só o `texto`.** O `assunto` fica de fora: é curto e não muda a dificuldade (decisão do Theo em 05/10/2026, mantida no código). Os 10 exemplos têm de 150 a 330 caracteres de texto, e o PRD supõe até cerca de 2.000. Texto longo tende a misturar assuntos (desempate 3).
-- ⚠️ **`critica` escalável só corrige alarme falso.** Se o Haiku diz `critica`, o Sonnet confirma ou rebaixa. O erro grave do PRD, porém, é o **contrário**: um crítico classificado como `media` ou `baixa`, e esse caso só escala se o Haiku declarar confiança baixa. Por isso, a métrica `criticos_subestimados` do **roteador** é o que decide. Se der > 0, acrescentar `alta` a `TRIAGEM_ROTEADOR_PRIORIDADES` antes de mexer no resto.
+- ⚠️ **`critica` escalável só corrige alarme falso.** Se o Haiku diz `critica`, o Sonnet confirma ou rebaixa. O erro grave do PRD, porém, é o **contrário**: um crítico classificado como `media` ou `baixa`, e esse caso só escala se o Haiku declarar confiança baixa. Por isso, a métrica `criticos_subestimados` do **roteador** é o que decide. Se der > 0, acrescentar `alta` a `TRIAGEM_ROTEADOR_PRIORIDADES` (`critica,alta`) antes de mexer no resto. `critica` continua obrigatória.
 
 #### Onde fica a orquestração
 
@@ -612,10 +612,13 @@ Um arquivo de configuração fica fora: com 3 valores, variáveis de ambiente ba
   | Haiku falhou na validação após 2 tentativas e escalou | **sim**: as 2 tentativas foram pagas, mais o Sonnet |
   | Recusa (`stop_reason = refusal`) | **sim**: a API devolve `usage` |
   | Sonnet (escalada) falhou na validação; fica a resposta do Haiku | **sim**: Haiku mais as tentativas do Sonnet |
-  | Erro de API sem resposta (429, timeout, conexão, 5xx) | não: não há `usage`, e a API não cobra |
+  | Erro de API sem resposta (429, timeout, conexão, 5xx) | não há `usage`: a chamada conta em `custos_desconhecidos` em vez de virar custo zero, e o `custo_usd` passa a ser um piso |
 
 - O mesmo vale quando o **resultado final é um erro**: um `ErroTriagem` que consumiu tokens tem custo, e esse custo vai para o registro (§14.2) e para o `custo_total_usd` do `avaliar`.
-- ⚠️ **Divergência no código atual (05/10/2026), tarefa do Rafa:** `servico.py` monta `roteamento.chamadas` só com resultados `ResultadoTriagem`, filtrando com `isinstance(r, ResultadoTriagem)` em `triar_chamado`. Assim, tentativas pagas que terminaram em `ErroTriagem` (validação ou recusa) somem do custo. A correção: `classificar()` passa a anexar o consumo também ao `ErroTriagem` (um campo `consumo: ChamadaModelo | None`, com tokens, custo e latência acumulados nas tentativas), e `triar_chamado` monta `chamadas` a partir de **todas** as tentativas com consumo.
+- **Implementação (conferida em 05/10/2026):**
+  - `classificar()` acumula o gasto de todas as tentativas. No `ErroTriagem`, esse gasto vai no campo interno `gasto: Meta | None`, que fica fora do JSON.
+  - `Meta.custos_desconhecidos` conta as chamadas pagas sem custo conhecido.
+  - `servico.py` soma tudo em `_meta_total`, e `persistencia.py` grava esse total também nas linhas de erro.
 - `latencia_ms` é a soma das latências de todas as chamadas, que é o que o usuário espera.
 - Se alguma chamada tiver custo `None` (modelo de fallback fora da tabela de preços), o total também vira `None`, mantendo a regra atual.
 - No modo fixo, `roteamento` traz `modo: "fixo"`, `escalado: false` e as chamadas daquele modelo.
@@ -626,15 +629,33 @@ Um arquivo de configuração fica fora: com 3 valores, variáveis de ambiente ba
 - `triagem avaliar --arquivo docs/exemplos.json --comparar` roda as três estratégias sobre o mesmo arquivo: `roteador` (auto), `sonnet` (fixo) e `haiku` (fixo).
 - Custo real estimado: cerca de US$ 0,15 por execução completa (30 chamados mais as escaladas).
 
+Formato (`modelos.RelatorioComparacao`). Os números são ilustrativos e coerentes entre si, com Haiku a US$ 0,0030 e Sonnet a US$ 0,0080 por chamado:
+
 ```json
 {
   "simulado": false,
-  "comparacao": [
-    {"estrategia": "roteador", "acerto_conjunto": 9, "criticos_subestimados": 0, "aprovado": true,
-     "custo_total_usd": 0.046, "custo_medio_usd": 0.0046, "latencia_p95_ms": 6100,
-     "taxa_escalonamento": 0.3, "escalonamentos_por_motivo": {"confianca_baixa": 2, "prioridade": 1}},
-    {"estrategia": "sonnet", "...": "..."},
-    {"estrategia": "haiku",  "...": "..."}
+  "comparacao": {
+    "aprovado": true,
+    "metas": {
+      "metas_individuais":     {"valor": "aprovado", "alvo": "todas as metas do PRD §5 no roteador", "status": "ok"},
+      "acerto_conjunto":       {"...": "..."},
+      "criticos_subestimados": {"...": "..."},
+      "economia_vs_sonnet":    {"valor": "32.5%", "alvo": ">= 30% (custo <= 70% do sempre-Sonnet)", "status": "ok"},
+      "acerto_vs_sonnet":      {"valor": "9 vs 9", "alvo": ">= acerto conjunto do sempre-Sonnet", "status": "ok"}
+    },
+    "economia_pct": 32.5,
+    "taxa_escalonamento": 0.3,
+    "escalonamentos_por_motivo": {"confianca_baixa": 2, "prioridade": 1},
+    "escalonamento_maximo_para_meta": 0.325,
+    "nota": "Com os custos médios medidos, a economia de 30% exige escalar no máximo 32.5% dos chamados (medido: 30.0%). ..."
+  },
+  "estrategias": [
+    {"estrategia": "roteador", "modelo": "auto", "total": 10, "acerto_conjunto": 9, "acerto_categoria": 10,
+     "criticos_subestimados": 0, "aprovado": true, "custo_total_usd": 0.054, "custo_medio_usd": 0.0054,
+     "economia_pct": 32.5, "latencia_p95_ms": 6100, "taxa_escalonamento": 0.3,
+     "escalonamentos_por_motivo": {"confianca_baixa": 2, "prioridade": 1}},
+    {"estrategia": "sonnet", "custo_medio_usd": 0.008, "economia_pct": 0.0, "...": "..."},
+    {"estrategia": "haiku",  "custo_medio_usd": 0.003, "economia_pct": 62.5, "...": "..."}
   ],
   "relatorios": {"roteador": { "...Relatorio completo..." }, "sonnet": {}, "haiku": {}},
   "aviso": null
@@ -642,7 +663,27 @@ Um arquivo de configuração fica fora: com 3 valores, variáveis de ambiente ba
 ```
 
 - **`Relatorio` ganha três campos:** `taxa_escalonamento`, `escalonamentos_por_motivo` e `acerto_por_confianca`. Os dois primeiros só fazem sentido no modo `auto`.
-- **Código de saída** do `--comparar`: 0 se o **roteador** for aprovado, 1 se não.
+- **Código de saída** do `--comparar`: 0 se `comparacao.aprovado` (todas as metas do bloco: metas individuais do roteador, economia e acerto vs Sonnet), 1 se não.
+
+#### Meta de economia do roteador: 30%
+
+> Decisão do usuário, transmitida pelo Theo em 05/10/2026: a meta passou de 40% para **30%**.
+
+- **Meta:** o roteador custa **no máximo 70% do sempre-Sonnet**, ou seja, `economia_pct >= 30`.
+- `economia_pct = (custo_medio_sonnet − custo_medio_roteador) / custo_medio_sonnet × 100`, medido na mesma execução do `--comparar`.
+- **Meta associada:** `acerto_vs_sonnet`, em que o acerto conjunto do roteador é **≥** o do sempre-Sonnet. A economia não vale se o roteador acertar menos.
+- **`escalonamento_maximo_para_meta`** é a maior taxa de escalonamento que ainda cumpre a meta, com os custos médios medidos de cada modelo. Pelo modelo simples (todo chamado paga o Haiku e uma fração *t* paga também o Sonnet), `custo_haiku + t × custo_sonnet ≤ 0,7 × custo_sonnet`, o que dá:
+
+  ```
+  escalonamento_maximo_para_meta = max(0; 0,7 − custo_haiku / custo_sonnet)
+  ```
+
+  Com Haiku a US$ 0,0030 e Sonnet a US$ 0,0080: `0,7 − 0,375 = 0,325`, ou seja, escalar até 32,5% dos chamados. A fórmula ignora os pré-roteados por texto longo, que vão direto ao Sonnet e só reduzem a folga. O resultado é 0 se nem sem escalar a meta for possível.
+- **Se a taxa medida passar do máximo:** ajustar o limiar de confiança. **As prioridades escaláveis não podem perder `critica`** (regra de segurança abaixo). O custo vem depois da segurança: se a meta de 30% só fecha deixando críticos sem escalar, a meta é que precisa mudar.
+- **Regra de segurança mantida (Theo): crítico sempre escala.** Um `critica` vindo do modelo base sempre é confirmado no Sonnet, qualquer que seja a configuração. `TRIAGEM_ROTEADOR_PRIORIDADES` só pode **acrescentar** prioridades a `critica`, nunca removê-la.
+- ✅ **Implementado (Rafa, conferido no código em 05/10/2026):**
+  - `avaliacao.META_ECONOMIA_PCT = 30.0`. `escalonamento_maximo()` e os textos de `alvo` e `nota` derivam da constante. O comentário de `BlocoComparacao.escalonamento_maximo_para_meta` (`modelos.py`) cita `0,7 − custo_haiku / custo_sonnet`.
+  - **Crítico sempre escala** é obrigatório: `RegraRoteamento.__post_init__` une `{critica}` às prioridades escaláveis quando a configuração a omite (ex.: `TRIAGEM_ROTEADOR_PRIORIDADES=alta` vira `{critica, alta}`). Isso vale tanto pelo construtor quanto por `do_ambiente()`.
 - `--comparar` é incompatível com `--modelo`; com `--repeticoes N`, cada estratégia roda N vezes.
 
 #### Simulado por modelo (comparação de custo demonstrável)
@@ -694,14 +735,20 @@ CREATE TABLE IF NOT EXISTS triagens (
   motivo_roteamento    TEXT,                         -- 'texto_longo' | 'confianca_baixa' | 'prioridade' | 'falha_validacao' | NULL
   tokens_entrada       INTEGER,
   tokens_saida         INTEGER,
-  custo_usd            REAL,
-  latencia_ms          INTEGER,
+  custo_usd            REAL,                         -- soma das chamadas pagas, inclusive em status 'erro'
+  custos_desconhecidos INTEGER NOT NULL DEFAULT 0,   -- nº de chamadas pagas sem custo conhecido (custo_usd é um piso)
+  latencia_ms          INTEGER,                      -- só em status 'ok'
   simulado             INTEGER NOT NULL DEFAULT 0,
   versao               TEXT    NOT NULL              -- triagem.__version__
 );
 CREATE INDEX IF NOT EXISTS idx_triagens_criado_em ON triagens (criado_em);
-PRAGMA user_version = 1;   -- migrações futuras comparam este número
+PRAGMA user_version = 2;   -- persistencia.VERSAO_SCHEMA
 ```
+
+> Conferido contra `src/triagem/persistencia.py` em 05/10/2026: as **25 colunas** batem em nome, tipo e ordem.
+> - **Coluna nova em relação ao desenho original:** `custos_desconhecidos`. Ela veio com o schema **v2**: `VERSAO_SCHEMA = 2`, e `_migrar()` faz `ALTER TABLE ... ADD COLUMN` em bancos v1.
+> - O hash cobre `assunto + "\n" + texto`, como no código.
+> - Em linhas `status = 'erro'`, `tokens_*` e `custo_usd` vêm de `ErroTriagem.gasto`, o que já foi pago até a falha. `modelo_final`, `categoria`, `prioridade`, `confianca` e `latencia_ms` ficam `NULL`.
 
 **Privacidade:**
 - Nunca grava a chave da API nem nada que venha de `Config`.
@@ -710,7 +757,7 @@ PRAGMA user_version = 1;   -- migrações futuras comparam este número
 - O hash permite contar chamados repetidos sem guardar o texto.
 
 **A gravação nunca derruba a triagem:**
-- `Registro.gravar(chamado, resultado) -> bool` captura `sqlite3.Error` e `OSError`, registra `log.warning` sem o texto e devolve `False`.
+- `Registro.gravar(chamado, resultado, roteamento=None, *, simulado=False) -> bool` captura `sqlite3.Error` e `OSError`, registra `log.warning` sem o texto e devolve `False`.
 - A conexão é aberta **a cada gravação**, com `sqlite3.connect(caminho, timeout=2)`. Isso é simples e seguro no threadpool do FastAPI, e o volume de uma pequena empresa não pede pool.
 - Se o banco não puder ser criado no startup, o servidor **sobe sem persistência**, com um aviso no log e `"banco": {"ativo": false}` no `/v1/stats`.
 - Linhas do modo simulado são gravadas com `simulado = 1`.
@@ -821,10 +868,12 @@ PRAGMA user_version = 1;   -- migrações futuras comparam este número
 3. **`roteador.py`:** `RegraRoteamento` (+ `do_ambiente`), `Decisao`, `decidir_modelo` e `deve_escalar`. **`tests/test_roteador.py`** com tabela de casos: texto no limite de caracteres, cada nível de confiança × limiar, `critica`/`alta`, falha de validação que escala, limite de taxa e recusa que não escalam, variáveis de ambiente inválidas. O limite de caracteres é testado **só com o `texto`**: um assunto longo com texto curto não pré-roteia.
 4. **`config.py`:** aceitar `auto`; constante `MODELO_SONNET`; `MODELO_PADRAO = "auto"` **já agora**. Ajustar os testes que assumem o Sonnet como padrão.
 5. **`servico.py`:** `Triador(regra=..., registro=...)`, orquestração, soma de custo e latência, escalada que falha devolvendo o resultado do Haiku. **`tests/test_servico.py`:** custo = soma das duas chamadas a preços diferentes; `meta.roteamento` em cada caminho.
-   - **Pendente (05/10/2026):** custo de chamadas pagas que falharam (§14.1, tabela de custo). Em `classificador.py`, acrescentar `ErroTriagem.consumo` com tokens, custo e latência das tentativas. Em `servico.py`, `roteamento.chamadas` passa a incluir **todas** as tentativas com consumo, sem o filtro `isinstance(r, ResultadoTriagem)`. Testes: Haiku inválido 2× e Sonnet ok (custo = 2 tentativas do Haiku + Sonnet); recusa com custo; escalada que falha na validação (custo do Sonnet entra, resposta do Haiku); 429 sem custo.
+   - **Feito (conferido em 05/10/2026):** custo de chamadas pagas que falharam, via `ErroTriagem.gasto` e `Meta.custos_desconhecidos` (§14.1, tabela de custo). Os testes precisam cobrir: Haiku inválido 2× e Sonnet ok (custo = 2 tentativas do Haiku + Sonnet); recusa com custo; escalada que falha na validação (custo do Sonnet entra, resposta do Haiku); 429/timeout contando em `custos_desconhecidos`.
+   - **Feito (conferido em 05/10/2026):** crítico sempre escala. `RegraRoteamento.__post_init__` completa com `critica` qualquer lista que a omita (ver "Meta de economia").
 6. **`simulado.py`:** `PerfilSimulado`, `ClienteSimulado.por_modelo` (resposta por conteúdo, tokens e confiança determinísticos). A CLI e o `TRIAGEM_SIMULADO=1` passam a usá-lo. Manter `do_gabarito` e `fixo` para os testes atuais.
 7. **`persistencia.py`** (`Registro`, `gravar`, `estatisticas`) + gravação em `classificar` (nunca em `avaliar`) + `TRIAGEM_DB`, `TRIAGEM_DB_GUARDAR_TEXTO` e `TRIAGEM_HASH_SEGREDO`. **`tests/test_persistencia.py`.** Acrescentar `data/` e `.vercel/` ao `.gitignore`.
 8. **`avaliacao.py` + `cli.py`:** `percentil(valores, p)`, `--comparar` e o aviso do simulado.
+   - **Feito (conferido em 05/10/2026):** `META_ECONOMIA_PCT = 30.0` em `avaliacao.py`; o comentário de `BlocoComparacao.escalonamento_maximo_para_meta` cita `0,7 − custo_haiku / custo_sonnet`.
 9. **`web.py`:** `GET /v1/stats`, criação do `Registro` no lifespan (falha → sem persistência) e `/v1/saude` com o modo e a regra. Testes em `test_web.py`.
 10. **Primeira medição real:** `triagem avaliar --arquivo docs/exemplos.json --comparar`, com custo estimado de US$ 0,15.
     - Registrar no README acerto, críticos subestimados, custo e p95 por estratégia, e calibrar os tokens do `PerfilSimulado`.

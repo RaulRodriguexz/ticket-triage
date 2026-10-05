@@ -100,7 +100,11 @@ def test_regra_do_ambiente():
     assert regra.confianca_minima == Confianca.alta
     assert regra.prioridades_escalaveis == frozenset({Prioridade.critica, Prioridade.alta})
     assert RegraRoteamento.do_ambiente({}) == REGRA
-    assert RegraRoteamento.do_ambiente({"TRIAGEM_ROTEADOR_PRIORIDADES": ""}).prioridades_escalaveis == frozenset()
+    # Regra de segurança: critica escala mesmo se a configuração a omitir.
+    assert RegraRoteamento.do_ambiente({"TRIAGEM_ROTEADOR_PRIORIDADES": ""}).prioridades_escalaveis == frozenset({Prioridade.critica})
+    assert RegraRoteamento.do_ambiente({"TRIAGEM_ROTEADOR_PRIORIDADES": "alta"}).prioridades_escalaveis == frozenset({Prioridade.critica, Prioridade.alta})
+    sem_critica = RegraRoteamento(prioridades_escalaveis=frozenset({Prioridade.alta}))
+    assert deve_escalar(_resultado(prioridade="critica"), sem_critica) == "prioridade"
 
 
 @pytest.mark.parametrize("variavel,valor", [

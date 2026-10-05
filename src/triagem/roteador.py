@@ -26,11 +26,18 @@ class RegraRoteamento:
     # Confiança do modelo base abaixo deste nível escala.
     confianca_minima: Confianca = Confianca.media
     # Prioridades que, vindas do modelo base, escalam para confirmação.
+    # Regra de segurança: `critica` sempre escala, mesmo que a configuração a omita.
     prioridades_escalaveis: frozenset[Prioridade] = field(
         default_factory=lambda: frozenset({Prioridade.critica})
     )
     # O modelo base esgotou as 2 tentativas de validação → tenta o forte.
     escalar_em_falha_validacao: bool = True
+
+    def __post_init__(self) -> None:
+        if Prioridade.critica not in self.prioridades_escalaveis:
+            object.__setattr__(
+                self, "prioridades_escalaveis", self.prioridades_escalaveis | {Prioridade.critica}
+            )
 
     @classmethod
     def do_ambiente(cls, ambiente: Mapping[str, str] | None = None) -> "RegraRoteamento":
