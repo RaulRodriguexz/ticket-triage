@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triagem"
+version = "0.2.0"
+description = "POC de triagem automática de chamados de suporte com Claude"
+requires-python = ">=3.11"
+dependencies = ["anthropic==1.11.0", "pydantic==2.13.5"]
+
+[project.optional-dependencies]
+web = ["fastapi==0.142.2", "uvicorn==0.54.0", "tzdata==2026.4"]
+dev = ["pytest==9.1.1", "httpx==0.28.1"]  # httpx: TestClient do FastAPI
+
+[project.scripts]
+triagem = "triagem.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+triagem = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["api: chama a API real (requer ANTHROPIC_API_KEY)"]
